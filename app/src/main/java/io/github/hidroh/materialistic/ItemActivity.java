@@ -1,89 +1,194 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic;
 
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
-import android.content.res.Configuration;
+import android.content.IntentFilter;
+import android.database.ContentObserver;
+import android.graphics.drawable.Drawable;
+import android.net.Uri;
 import android.os.Bundle;
-import android.support.v7.widget.CardView;
+import android.os.Handler;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
+import android.support.design.widget.AppBarLayout;
+import android.support.design.widget.CoordinatorLayout;
+import android.support.design.widget.FloatingActionButton;
+import android.support.design.widget.Snackbar;
+import android.support.design.widget.TabLayout;
+import android.support.v4.app.Fragment;
+import android.support.v4.content.ContextCompat;
+import android.support.v4.content.LocalBroadcastManager;
+import android.support.v4.graphics.drawable.DrawableCompat;
+import android.support.v7.app.ActionBar;
+import android.support.v7.widget.Toolbar;
 import android.text.TextUtils;
+import android.text.method.LinkMovementMethod;
+import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
-import android.view.ViewGroup;
-import android.widget.RelativeLayout;
+import android.widget.ImageButton;
+import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import io.github.hidroh.materialistic.data.FavoriteManager;
-import io.github.hidroh.materialistic.data.HackerNewsClient;
-import io.github.hidroh.materialistic.data.ItemManager;
+import java.lang.ref.WeakReference;
 
-public class ItemActivity extends BaseItemActivity {
+import javax.inject.Inject;
+import javax.inject.Named;
+
+import io.github.hidroh.materialistic.accounts.UserServices;
+import io.github.hidroh.materialistic.annotation.Synthetic;
+import io.github.hidroh.materialistic.data.FavoriteManager;
+import io.github.hidroh.materialistic.data.Item;
+import io.github.hidroh.materialistic.data.ItemManager;
+import io.github.hidroh.materialistic.data.MaterialisticProvider;
+import io.github.hidroh.materialistic.data.ResponseListener;
+import io.github.hidroh.materialistic.data.SessionManager;
+import io.github.hidroh.materialistic.data.WebItem;
+import io.github.hidroh.materialistic.widget.ItemPagerAdapter;
+import io.github.hidroh.materialistic.widget.NavFloatingActionButton;
+import io.github.hidroh.materialistic.widget.PopupMenu;
+import io.github.hidroh.materialistic.widget.ViewPager;
+
+public class ItemActivity extends InjectableActivity implements ItemFragment.ItemChangedListener {
 
     public static final String EXTRA_ITEM = ItemActivity.class.getName() + ".EXTRA_ITEM";
-    public static final String EXTRA_ITEM_ID = ItemActivity.class.getName() + ".EXTRA_ITEM_ID";
-    public static final String EXTRA_ITEM_LEVEL = ItemActivity.class.getName() + ".EXTRA_ITEM_LEVEL";
+    public static final String EXTRA_CACHE_MODE = ItemActivity.class.getName() + ".EXTRA_CACHE_MODE";
+    public static final String EXTRA_OPEN_COMMENTS = ItemActivity.class.getName() + ".EXTRA_OPEN_COMMENTS";
     private static final String PARAM_ID = "id";
-    private ItemManager.Item mItem;
-    private CardView mHeaderCardView;
-    private boolean mFavoriteBound;
-    private boolean mIsResumed = true;
-    private boolean mOrientationChanged = false;
+    private static final String STATE_ITEM = "state:item";
+    private static final String STATE_ITEM_ID = "state:itemId";
+    private static final String STATE_FULLSCREEN = "state:fullscreen";
+    @Synthetic WebItem mItem;
+    @Synthetic String mItemId = null;
+    @Synthetic ImageView mBookmark;
+    private boolean mExternalBrowser;
+    private Preferences.StoryViewMode mStoryViewMode;
+    @Inject @Named(ActivityModule.HN) ItemManager mItemManager;
+    @Inject FavoriteManager mFavoriteManager;
+    @Inject AlertDialogBuilder mAlertDialogBuilder;
+    @Inject PopupMenu mPopupMenu;
+    @Inject UserServices mUserServices;
+    @Inject SessionManager mSessionManager;
+    @Inject CustomTabsDelegate mCustomTabsDelegate;
+    @Inject KeyDelegate mKeyDelegate;
+    private TabLayout mTabLayout;
+    @Synthetic AppBarLayout mAppBar;
+    @Synthetic CoordinatorLayout mCoordinatorLayout;
+    private ImageButton mVoteButton;
+    private FloatingActionButton mReplyButton;
+    private NavFloatingActionButton mNavButton;
+    private ItemPagerAdapter mAdapter;
+    private ViewPager mViewPager;
+    @Synthetic boolean mFullscreen;
+    private final ContentObserver mObserver = new ContentObserver(new Handler()) {
+        @Override
+        public void onChange(boolean selfChange, Uri uri) {
+            if (mItem == null) {
+                return;
+            }
+            if (FavoriteManager.isCleared(uri)) {
+                mItem.setFavorite(false);
+                bindFavorite();
+            } else if (TextUtils.equals(mItemId, uri.getLastPathSegment())) {
+                mItem.setFavorite(FavoriteManager.isAdded(uri));
+                bindFavorite();
+            }
+        }
+    };
+    private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            mFullscreen = intent.getBooleanExtra(BaseWebFragment.EXTRA_FULLSCREEN, false);
+            setFullscreen();
+        }
+    };
+    private final Preferences.Observable mPreferenceObservable = new Preferences.Observable();
+    private AppUtils.SystemUiHelper mSystemUiHelper;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        mExternalBrowser = Preferences.externalBrowserEnabled(this);
+        if (getIntent().getBooleanExtra(EXTRA_OPEN_COMMENTS, false)) {
+            mStoryViewMode = Preferences.StoryViewMode.Comment;
+        } else {
+            mStoryViewMode = Preferences.getDefaultStoryView(this);
+        }
         setContentView(R.layout.activity_item);
-
+        setSupportActionBar((Toolbar) findViewById(R.id.toolbar));
+        //noinspection ConstantConditions
+        getSupportActionBar().setDisplayOptions(ActionBar.DISPLAY_SHOW_HOME |
+                ActionBar.DISPLAY_HOME_AS_UP);
+        mSystemUiHelper = new AppUtils.SystemUiHelper(getWindow());
+        mReplyButton = (FloatingActionButton) findViewById(R.id.reply_button);
+        mNavButton = (NavFloatingActionButton) findViewById(R.id.navigation_button);
+        mNavButton.setNavigable(direction ->
+                // if callback is fired navigable should not be null
+                AppUtils.navigate(direction, mAppBar, (Navigable) mAdapter.getItem(0)));
+        mVoteButton = (ImageButton) findViewById(R.id.vote_button);
+        mBookmark = (ImageView) findViewById(R.id.bookmarked);
+        mCoordinatorLayout = (CoordinatorLayout) findViewById(R.id.content_frame);
+        mAppBar = (AppBarLayout) findViewById(R.id.appbar);
+        mTabLayout = (TabLayout) findViewById(R.id.tab_layout);
+        mViewPager = (ViewPager) findViewById(R.id.view_pager);
+        AppUtils.toggleFab(mNavButton, false);
+        AppUtils.toggleFab(mReplyButton, false);
         final Intent intent = getIntent();
-        String itemId = null;
-        if (intent.hasExtra(EXTRA_ITEM)) {
-            ItemManager.WebItem item = intent.getParcelableExtra(EXTRA_ITEM);
-            itemId = item.getId();
-            if (item instanceof ItemManager.Item) {
-                mItem = (ItemManager.Item) item;
-                bindData(mItem);
-                return;
+        getContentResolver().registerContentObserver(MaterialisticProvider.URI_FAVORITE,
+                true, mObserver);
+        LocalBroadcastManager.getInstance(this).registerReceiver(mReceiver,
+                new IntentFilter(BaseWebFragment.ACTION_FULLSCREEN));
+        mPreferenceObservable.subscribe(this, this::onPreferenceChanged,
+                R.string.pref_navigation);
+        if (savedInstanceState != null) {
+            mItem = savedInstanceState.getParcelable(STATE_ITEM);
+            mItemId = savedInstanceState.getString(STATE_ITEM_ID);
+            mFullscreen = savedInstanceState.getBoolean(STATE_FULLSCREEN);
+        } else {
+            if (Intent.ACTION_VIEW.equalsIgnoreCase(intent.getAction())) {
+                mItemId = AppUtils.getDataUriId(intent, PARAM_ID);
+            } else if (intent.hasExtra(EXTRA_ITEM)) {
+                mItem = intent.getParcelableExtra(EXTRA_ITEM);
+                mItemId = mItem.getId();
             }
         }
 
-        if (TextUtils.isEmpty(itemId)) {
-            itemId = getIntent().getStringExtra(EXTRA_ITEM_ID);
+        if (mItem != null) {
+            bindData(mItem);
+        } else if (!TextUtils.isEmpty(mItemId)) {
+            mItemManager.getItem(mItemId,
+                    getIntent().getIntExtra(EXTRA_CACHE_MODE, ItemManager.MODE_DEFAULT),
+                    new ItemResponseListener(this));
         }
-
-        if (TextUtils.isEmpty(itemId)) {
-            if (intent.getAction() != null && Intent.ACTION_VIEW.equals(intent.getAction())) {
-                itemId = intent.getData() != null ? intent.getData().getQueryParameter(PARAM_ID) : null;
-            }
-        }
-
-        if (!TextUtils.isEmpty(itemId)) {
-            HackerNewsClient.getInstance(this).getItem(itemId, new ItemManager.ResponseListener<ItemManager.Item>() {
-                @Override
-                public void onResponse(ItemManager.Item response) {
-                    mItem = response;
-                    supportInvalidateOptionsMenu();
-                    bindData(mItem);
-                    bindFavorite();
-                }
-
-                @Override
-                public void onError(String errorMessage) {
-                    // do nothing
-                }
-            });
+        if (!AppUtils.hasConnection(this)) {
+            Snackbar.make(mCoordinatorLayout, R.string.offline_notice, Snackbar.LENGTH_LONG).show();
         }
     }
 
     @Override
-    public void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        mOrientationChanged = !mOrientationChanged;
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        bindFavorite();
+    protected void onStart() {
+        super.onStart();
+        mCustomTabsDelegate.bindCustomTabsService(this);
+        mKeyDelegate.attach(this);
     }
 
     @Override
@@ -94,182 +199,301 @@ public class ItemActivity extends BaseItemActivity {
 
     @Override
     public boolean onPrepareOptionsMenu(Menu menu) {
+        menu.findItem(R.id.menu_share).setVisible(mItem != null);
         return mItem != null;
     }
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == R.id.menu_external) {
-            AppUtils.openWebUrlExternal(this, mItem.getUrl());
+        if (item.getItemId() == android.R.id.home) {
+            finish();
             return true;
         }
-
+        if (item.getItemId() == R.id.menu_external) {
+            View anchor = findViewById(R.id.menu_external);
+            AppUtils.openExternal(this, mPopupMenu, anchor == null ?
+                    findViewById(R.id.toolbar) : anchor, mItem,
+                    mCustomTabsDelegate.getSession());
+            return true;
+        }
+        if (item.getItemId() == R.id.menu_share) {
+            View anchor = findViewById(R.id.menu_share);
+            AppUtils.share(this, mPopupMenu, anchor == null ?
+                    findViewById(R.id.toolbar) : anchor, mItem);
+            return true;
+        }
         return super.onOptionsItemSelected(item);
     }
 
     @Override
-    protected void onPostResume() {
-        super.onPostResume();
-        mIsResumed = true;
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putParcelable(STATE_ITEM, mItem);
+        outState.putString(STATE_ITEM_ID, mItemId);
+        outState.putBoolean(STATE_FULLSCREEN, mFullscreen);
     }
 
     @Override
-    protected void onPause() {
-        mFavoriteBound = false;
-        mIsResumed = false;
-        super.onPause();
+    protected void onStop() {
+        super.onStop();
+        mCustomTabsDelegate.unbindCustomTabsService(this);
+        mKeyDelegate.detach(this);
     }
 
     @Override
-    public void supportFinishAfterTransition() {
-        if (mOrientationChanged) {
-            /**
-             * if orientation changed, finishing activity with shared element
-             * transition may cause NPE if the original element is not visible in the returned
-             * activity due to new orientation, we just finish without transition here
-             */
-            finish();
+    protected void onDestroy() {
+        super.onDestroy();
+        getContentResolver().unregisterContentObserver(mObserver);
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(mReceiver);
+        mPreferenceObservable.unsubscribe(this);
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (!mFullscreen) {
+            super.onBackPressed();
         } else {
-            super.supportFinishAfterTransition();
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(
+                    WebFragment.ACTION_FULLSCREEN).putExtra(WebFragment.EXTRA_FULLSCREEN, false));
         }
     }
 
-    private void bindFavorite() {
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        mKeyDelegate.setScrollable(getCurrent(Scrollable.class), mAppBar);
+        mKeyDelegate.setBackInterceptor(getCurrent(KeyDelegate.BackInterceptor.class));
+        return mKeyDelegate.onKeyDown(keyCode, event) ||
+                super.onKeyDown(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        return mKeyDelegate.onKeyUp(keyCode, event) ||
+                super.onKeyUp(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyLongPress(int keyCode, KeyEvent event) {
+        return mKeyDelegate.onKeyLongPress(keyCode, event) ||
+                super.onKeyLongPress(keyCode, event);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        mSystemUiHelper.setFullscreen(hasFocus && mFullscreen);
+    }
+
+    @Override
+    public void onItemChanged(@NonNull Item item) {
+        mItem = item;
+        if (mTabLayout.getTabCount() > 0) {
+            //noinspection ConstantConditions
+            mTabLayout.getTabAt(0).setText(getResources()
+                    .getQuantityString(R.plurals.comments_count, item.getKidCount(), item.getKidCount()));
+        }
+    }
+
+    @Synthetic
+    void setFullscreen() {
+        mSystemUiHelper.setFullscreen(mFullscreen);
+        mAppBar.setExpanded(!mFullscreen, true);
+        mKeyDelegate.setAppBarEnabled(!mFullscreen);
+        mViewPager.setSwipeEnabled(!mFullscreen);
+        AppUtils.toggleFab(mReplyButton, !mFullscreen);
+    }
+
+    @Synthetic
+    void onItemLoaded(@Nullable Item response) {
+        mItem = response;
+        supportInvalidateOptionsMenu();
+        bindData(mItem);
+    }
+
+    @Synthetic
+    void bindFavorite() {
         if (mItem == null) {
             return;
         }
-
-        if (!mItem.isShareable()) {
+        if (!mItem.isStoryType()) {
             return;
         }
+        mBookmark.setVisibility(View.VISIBLE);
+        decorateFavorite(mItem.isFavorite());
+        mBookmark.setOnClickListener(new View.OnClickListener() {
+            private boolean mUndo;
 
-        if (mFavoriteBound) { // prevent binding twice from onResponse and onResume
-            return;
-        }
-
-        mFavoriteBound = true;
-        FavoriteManager.check(this, mItem.getId(), new FavoriteManager.OperationCallbacks() {
             @Override
-            public void onCheckComplete(boolean isFavorite) {
-                super.onCheckComplete(isFavorite);
-                decorateFavorite(isFavorite);
-                mItem.setFavorite(isFavorite);
-                mHeaderCardView.setOnLongClickListener(new View.OnLongClickListener() {
-                    @Override
-                    public boolean onLongClick(View v) {
-                        final int toastMessageResId;
-                        if (!mItem.isFavorite()) {
-                            FavoriteManager.add(ItemActivity.this, mItem);
-                            toastMessageResId = R.string.toast_saved;
-                        } else {
-                            FavoriteManager.remove(ItemActivity.this, mItem.getId());
-                            toastMessageResId = R.string.toast_removed;
-                        }
-                        Toast.makeText(ItemActivity.this, toastMessageResId, Toast.LENGTH_SHORT).show();
-                        mItem.setFavorite(!mItem.isFavorite());
-                        decorateFavorite(mItem.isFavorite());
-                        return true;
-                    }
-                });
-
+            public void onClick(View v) {
+                final int toastMessageResId;
+                if (!mItem.isFavorite()) {
+                    mFavoriteManager.add(ItemActivity.this, mItem);
+                    toastMessageResId = R.string.toast_saved;
+                } else {
+                    mFavoriteManager.remove(ItemActivity.this, mItem.getId());
+                    toastMessageResId = R.string.toast_removed;
+                }
+                if (!mUndo) {
+                    Snackbar.make(mCoordinatorLayout, toastMessageResId, Snackbar.LENGTH_SHORT)
+                            .setAction(R.string.undo, v1 -> {
+                                mUndo = true;
+                                mBookmark.performClick();
+                            })
+                            .show();
+                }
+                mUndo = false;
             }
         });
     }
 
-    private void bindData(final ItemManager.Item story) {
+    @SuppressWarnings("ConstantConditions")
+    private void bindData(@Nullable final WebItem story) {
         if (story == null) {
             return;
         }
-
-        if (story.getKidCount() > 0) {
-            setTitle(getString(R.string.title_activity_item_count, story.getKidCount()));
-        }
+        mCustomTabsDelegate.mayLaunchUrl(Uri.parse(story.getUrl()), null, null);
+        bindFavorite();
+        mSessionManager.view(this, story.getId());
+        mVoteButton.setVisibility(View.VISIBLE);
+        mVoteButton.setOnClickListener(v -> vote(story));
         final TextView titleTextView = (TextView) findViewById(android.R.id.text2);
-        mHeaderCardView = (CardView) findViewById(R.id.header_card_view);
-        if (story.isShareable()) {
+        if (story.isStoryType()) {
             titleTextView.setText(story.getDisplayedTitle());
-            titleTextView.setTextAppearance(this, R.style.textTitleStyle);
+            setTaskTitle(story.getDisplayedTitle());
             if (!TextUtils.isEmpty(story.getSource())) {
                 TextView sourceTextView = (TextView) findViewById(R.id.source);
                 sourceTextView.setText(story.getSource());
                 sourceTextView.setVisibility(View.VISIBLE);
             }
         } else {
-            AppUtils.setHtmlText(titleTextView, story.getDisplayedTitle());
-        }
-        mHeaderCardView.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                if (story.isShareable()) {
-                    AppUtils.openWebUrl(ItemActivity.this, story);
-                } else {
-                    toggle();
-                }
-            }
-
-            private void toggle() {
-                final boolean isExpanded = titleTextView.getEllipsize() == null;
-                titleTextView.setMaxLines(isExpanded ?
-                        getResources().getInteger(R.integer.header_max_lines) : Integer.MAX_VALUE);
-                titleTextView.setEllipsize(isExpanded ? TextUtils.TruncateAt.END : null);
-                // TODO need to be scrollable if text is very long
-                AppUtils.setHtmlText(titleTextView, story.getDisplayedTitle());
-            }
-        });
-
-        int level = getIntent().getIntExtra(EXTRA_ITEM_LEVEL, 0);
-        int stackResId = -1;
-        int marginTop = getResources().getDimensionPixelSize(R.dimen.cardview_header_elevation) * Math.min(level, 4);
-        // TODO can improve?
-        switch (level) {
-            case 0:
-                break;
-            case 1:
-                stackResId = R.layout.header_stack_1;
-                break;
-            case 2:
-                stackResId = R.layout.header_stack_2;
-                break;
-            case 3:
-                stackResId = R.layout.header_stack_3;
-                break;
-            case 4:
-            default:
-                stackResId = R.layout.header_stack_4;
-                break;
-        }
-        if (stackResId != -1) {
-            getLayoutInflater().inflate(stackResId, (ViewGroup) findViewById(R.id.item_view), true);
-            RelativeLayout.LayoutParams params = (RelativeLayout.LayoutParams) mHeaderCardView.getLayoutParams();
-            params.topMargin = marginTop;
-            mHeaderCardView.setLayoutParams(params);
-            mHeaderCardView.bringToFront();
+            CharSequence title = AppUtils.fromHtml(story.getDisplayedTitle());
+            titleTextView.setText(title);
+            setTaskTitle(title);
         }
 
         final TextView postedTextView = (TextView) findViewById(R.id.posted);
         postedTextView.setText(story.getDisplayedTime(this));
+        postedTextView.append(story.getDisplayedAuthor(this, true, 0));
+        postedTextView.setMovementMethod(LinkMovementMethod.getInstance());
         switch (story.getType()) {
-            case job:
-                postedTextView.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_work_grey600_18dp, 0, 0, 0);
+            case Item.JOB_TYPE:
+                postedTextView.setCompoundDrawablesWithIntrinsicBounds(
+                        R.drawable.ic_work_white_18dp, 0, 0, 0);
                 break;
-            case poll:
-                postedTextView.setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_poll_grey600_18dp, 0, 0, 0);
+            case Item.POLL_TYPE:
+                postedTextView.setCompoundDrawablesWithIntrinsicBounds(
+                        R.drawable.ic_poll_white_18dp, 0, 0, 0);
                 break;
         }
-        final Bundle args = new Bundle();
-        args.putInt(EXTRA_ITEM_LEVEL, getIntent().getIntExtra(EXTRA_ITEM_LEVEL, 0));
-        if (mIsResumed) {
-            getSupportFragmentManager()
-                    .beginTransaction()
-                    .replace(R.id.sub_item_view,
-                            ItemFragment.instantiate(this, mItem, args),
-                            ItemFragment.class.getName())
-                    .commit();
+        mAdapter = new ItemPagerAdapter(this, getSupportFragmentManager(),
+                new ItemPagerAdapter.Builder()
+                        .setItem(story)
+                        .setShowArticle(!mExternalBrowser)
+                        .setCacheMode(getIntent().getIntExtra(EXTRA_CACHE_MODE, ItemManager.MODE_DEFAULT))
+                        .setDefaultViewMode(mStoryViewMode));
+        mAdapter.bind(mViewPager, mTabLayout, mNavButton, mReplyButton);
+        mTabLayout.addOnTabSelectedListener(new TabLayout.ViewPagerOnTabSelectedListener(mViewPager) {
+            @Override
+            public void onTabReselected(TabLayout.Tab tab) {
+                mAppBar.setExpanded(true, true);
+            }
+        });
+        if (story.isStoryType() && mExternalBrowser) {
+            findViewById(R.id.header_card_view).setOnClickListener(v ->
+                    AppUtils.openWebUrlExternal(ItemActivity.this,
+                            story, story.getUrl(), mCustomTabsDelegate.getSession()));
+        } else {
+            findViewById(R.id.header_card_view).setClickable(false);
+        }
+        if (mFullscreen) {
+            setFullscreen();
         }
     }
 
     private void decorateFavorite(boolean isFavorite) {
-        mHeaderCardView.findViewById(R.id.bookmarked)
-                .setVisibility(isFavorite ? View.VISIBLE : View.INVISIBLE);
+        mBookmark.setImageResource(isFavorite ?
+                R.drawable.ic_bookmark_white_24dp : R.drawable.ic_bookmark_border_white_24dp);
+    }
+
+    private <T> T getCurrent(Class<T> clazz) {
+        if (mAdapter == null) {
+            return null;
+        }
+        Fragment currentItem = mAdapter.getItem(mViewPager.getCurrentItem());
+        if (clazz.isInstance(currentItem)) {
+            //noinspection unchecked
+            return (T) currentItem;
+        } else {
+            return null;
+        }
+    }
+
+    private void vote(final WebItem story) {
+        mUserServices.voteUp(ItemActivity.this, story.getId(), new VoteCallback(this));
+    }
+
+    @Synthetic
+    void onVoted(Boolean successful) {
+        if (successful == null) {
+            Toast.makeText(this, R.string.vote_failed, Toast.LENGTH_SHORT).show();
+        } else if (successful) {
+            Drawable drawable = DrawableCompat.wrap(mVoteButton.getDrawable());
+            DrawableCompat.setTint(drawable, ContextCompat.getColor(this, R.color.greenA700));
+            Toast.makeText(this, R.string.voted, Toast.LENGTH_SHORT).show();
+        } else {
+            AppUtils.showLogin(this, mAlertDialogBuilder);
+        }
+    }
+
+    private void onPreferenceChanged(int key, boolean contextChanged) {
+        AppUtils.toggleFab(mNavButton, navigationVisible());
+    }
+
+    private boolean navigationVisible() {
+        return mViewPager.getCurrentItem() == 0 && Preferences.navigationEnabled(this);
+    }
+
+    static class ItemResponseListener implements ResponseListener<Item> {
+        private final WeakReference<ItemActivity> mItemActivity;
+
+        @Synthetic
+        ItemResponseListener(ItemActivity itemActivity) {
+            mItemActivity = new WeakReference<>(itemActivity);
+        }
+
+        @Override
+        public void onResponse(@Nullable Item response) {
+            if (mItemActivity.get() != null && !mItemActivity.get().isActivityDestroyed()) {
+                mItemActivity.get().onItemLoaded(response);
+            }
+        }
+
+        @Override
+        public void onError(String errorMessage) {
+            // do nothing
+        }
+    }
+
+    static class VoteCallback extends UserServices.Callback {
+        private final WeakReference<ItemActivity> mItemActivity;
+
+        @Synthetic
+        VoteCallback(ItemActivity itemActivity) {
+            mItemActivity = new WeakReference<>(itemActivity);
+        }
+
+        @Override
+        public void onDone(boolean successful) {
+            if (mItemActivity.get() != null && !mItemActivity.get().isActivityDestroyed()) {
+                mItemActivity.get().onVoted(successful);
+            }
+        }
+
+        @Override
+        public void onError(Throwable throwable) {
+            if (mItemActivity.get() != null && !mItemActivity.get().isActivityDestroyed()) {
+                mItemActivity.get().onVoted(null);
+            }
+        }
     }
 }

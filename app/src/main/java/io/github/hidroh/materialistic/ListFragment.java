@@ -1,115 +1,113 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic;
 
-import android.app.Activity;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.res.Configuration;
 import android.os.Bundle;
-import android.os.Parcelable;
 import android.support.annotation.Nullable;
-import android.support.v4.app.Fragment;
-import android.support.v4.content.LocalBroadcastManager;
 import android.support.v4.widget.SwipeRefreshLayout;
-import android.support.v7.widget.LinearLayoutManager;
 import android.support.v7.widget.RecyclerView;
 import android.text.TextUtils;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.LinearLayout;
-import android.widget.TextView;
 import android.widget.Toast;
 
-import java.util.HashSet;
-import java.util.Set;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Arrays;
 
-import io.github.hidroh.materialistic.data.FavoriteManager;
+import javax.inject.Inject;
+import javax.inject.Named;
+
+import io.github.hidroh.materialistic.annotation.Synthetic;
+import io.github.hidroh.materialistic.data.AlgoliaClient;
+import io.github.hidroh.materialistic.data.AlgoliaPopularClient;
+import io.github.hidroh.materialistic.data.Item;
 import io.github.hidroh.materialistic.data.ItemManager;
+import io.github.hidroh.materialistic.data.ResponseListener;
+import io.github.hidroh.materialistic.widget.ListRecyclerViewAdapter;
+import io.github.hidroh.materialistic.widget.StoryRecyclerViewAdapter;
 
-public class ListFragment extends Fragment {
+public class ListFragment extends BaseListFragment {
 
-    private static final String EXTRA_ITEMS = ListFragment.class.getName() + ".EXTRA_ITEMS";
-    private RecyclerView mRecyclerView;
-    private ItemRecyclerViewAdapter mAdapter;
+    public static final String EXTRA_ITEM_MANAGER = ListFragment.class.getName() + ".EXTRA_ITEM_MANAGER";
+    public static final String EXTRA_FILTER = ListFragment.class.getName() + ".EXTRA_FILTER";
+    private static final String STATE_FILTER = "state:filter";
+    private static final String STATE_CACHE_MODE = "state:cacheMode";
+    private final Preferences.Observable mPreferenceObservable = new Preferences.Observable();
+    private final StoryRecyclerViewAdapter mAdapter = new StoryRecyclerViewAdapter();
     private SwipeRefreshLayout mSwipeRefreshLayout;
-    private BroadcastReceiver mBroadcastReceiver;
-    private int mLocalRevision = 0;
-    private ItemManager.Item[] mItems = new ItemManager.Item[0];
+    @Inject @Named(ActivityModule.HN) ItemManager mHnItemManager;
+    @Inject @Named(ActivityModule.ALGOLIA) ItemManager mAlgoliaItemManager;
+    @Inject @Named(ActivityModule.POPULAR) ItemManager mPopularItemManager;
     private ItemManager mItemManager;
     private View mErrorView;
     private View mEmptyView;
-    private Set<String> mChangedFavorites = new HashSet<>();
-    private ItemOpenListener mItemOpenListener;
+    private RefreshCallback mRefreshCallback;
     private String mFilter;
+    private int mCacheMode = ItemManager.MODE_DEFAULT;
 
-    public static ListFragment instantiate(Context context, ItemManager itemManager,
-                                           String filter) {
-        ListFragment fragment = (ListFragment) Fragment.instantiate(context, ListFragment.class.getName());
-        fragment.mItemManager = itemManager;
-        fragment.mFilter = filter;
-        return fragment;
+    public interface RefreshCallback {
+        void onRefreshed();
     }
 
     @Override
-    public void onAttach(Activity activity) {
-        super.onAttach(activity);
-        mItemOpenListener = (ItemOpenListener) activity;
-        mBroadcastReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (TextUtils.isEmpty(intent.getAction())) {
-                    return;
-                }
-
-                if (FavoriteManager.ACTION_CLEAR.equals(intent.getAction())) {
-                    mLocalRevision++;
-                } else if (FavoriteManager.ACTION_ADD.equals(intent.getAction())) {
-                    mChangedFavorites.add(intent.getStringExtra(FavoriteManager.ACTION_ADD_EXTRA_DATA));
-                } else if (FavoriteManager.ACTION_REMOVE.equals(intent.getAction())) {
-                    mChangedFavorites.add(intent.getStringExtra(FavoriteManager.ACTION_REMOVE_EXTRA_DATA));
-                }
-            }
-        };
-        LocalBroadcastManager.getInstance(getActivity())
-                .registerReceiver(mBroadcastReceiver, FavoriteManager.makeClearIntentFilter());
-        LocalBroadcastManager.getInstance(getActivity())
-                .registerReceiver(mBroadcastReceiver, FavoriteManager.makeAddIntentFilter());
-        LocalBroadcastManager.getInstance(getActivity())
-                .registerReceiver(mBroadcastReceiver, FavoriteManager.makeRemoveIntentFilter());
+    public void onAttach(Context context) {
+        super.onAttach(context);
+        if (context instanceof RefreshCallback) {
+            mRefreshCallback = (RefreshCallback) context;
+        }
+        mPreferenceObservable.subscribe(context, this::onPreferenceChanged,
+                R.string.pref_highlight_updated,
+                R.string.pref_username,
+                R.string.pref_auto_viewed);
+    }
+    @Override
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (savedInstanceState != null) {
+            mFilter = savedInstanceState.getString(STATE_FILTER);
+            mCacheMode = savedInstanceState.getInt(STATE_CACHE_MODE);
+        } else {
+            mFilter = getArguments().getString(EXTRA_FILTER);
+        }
+        mAdapter.initDisplayOptions(getActivity());
+        mAdapter.setCacheMode(mCacheMode);
     }
 
     @Override
-    public View onCreateView(LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
+    public View onCreateView(LayoutInflater inflater, @Nullable ViewGroup container,
+                             @Nullable Bundle savedInstanceState) {
         final View view = inflater.inflate(R.layout.fragment_list, container, false);
-        mErrorView = view.findViewById(android.R.id.empty);
+        mErrorView = view.findViewById(R.id.empty);
         mEmptyView = view.findViewById(R.id.empty_search);
         mRecyclerView = (RecyclerView) view.findViewById(R.id.recycler_view);
-        mRecyclerView.setLayoutManager(new LinearLayoutManager(getActivity()) {
-            @Override
-            public int getOrientation() {
-                return LinearLayout.VERTICAL;
-            }
-        });
-        mRecyclerView.setHasFixedSize(true);
-        mAdapter = new RecyclerViewAdapter();
-        mRecyclerView.setAdapter(mAdapter);
         mSwipeRefreshLayout = (SwipeRefreshLayout) view.findViewById(R.id.swipe_layout);
-        mSwipeRefreshLayout.setColorSchemeResources(R.color.textColorPrimary);
-        mSwipeRefreshLayout.setProgressBackgroundColor(R.color.colorAccent);
+        mSwipeRefreshLayout.setColorSchemeResources(R.color.white);
+        mSwipeRefreshLayout.setProgressBackgroundColorSchemeResource(
+                AppUtils.getThemedResId(getActivity(), R.attr.colorAccent));
         if (savedInstanceState == null) {
-            mSwipeRefreshLayout.post(new Runnable() {
-                @Override
-                public void run() {
-                    mSwipeRefreshLayout.setRefreshing(true);
-                }
-            });
+            mSwipeRefreshLayout.setRefreshing(true);
         }
-        mSwipeRefreshLayout.setOnRefreshListener(new SwipeRefreshLayout.OnRefreshListener() {
-            @Override
-            public void onRefresh() {
-                bindData();
-            }
+        mSwipeRefreshLayout.setOnRefreshListener(() -> {
+            mCacheMode = ItemManager.MODE_NETWORK;
+            mAdapter.setCacheMode(mCacheMode);
+            refresh();
         });
         return view;
     }
@@ -117,189 +115,123 @@ public class ListFragment extends Fragment {
     @Override
     public void onActivityCreated(@Nullable Bundle savedInstanceState) {
         super.onActivityCreated(savedInstanceState);
-        if (savedInstanceState == null) {
-            bindData();
+        String managerClassName = getArguments().getString(EXTRA_ITEM_MANAGER);
+        if (TextUtils.equals(managerClassName, AlgoliaClient.class.getName())) {
+            mItemManager = mAlgoliaItemManager;
+        } else if (TextUtils.equals(managerClassName, AlgoliaPopularClient.class.getName())) {
+            mItemManager = mPopularItemManager;
         } else {
-            final Parcelable[] savedItems = savedInstanceState.getParcelableArray(EXTRA_ITEMS);
-            if (savedItems instanceof ItemManager.Item[]) {
-                mItems = (ItemManager.Item[]) savedItems;
-                mAdapter.notifyDataSetChanged();
-            }
+            mItemManager = mHnItemManager;
         }
-    }
-
-    @Override
-    public void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        mAdapter.mSelectedItemId = null;
-        mAdapter.notifyDataSetChanged();
-    }
-
-    @Override
-    public void onResume() {
-        super.onResume();
-        // refresh favorite state if any changes
-        mAdapter.notifyDataSetChanged();
+        mAdapter.setHotThresHold(AppUtils.HOT_THRESHOLD_NORMAL);
+        if (mItemManager == mHnItemManager && mFilter != null) {
+            switch (mFilter) {
+                case ItemManager.BEST_FETCH_MODE:
+                    mAdapter.setHotThresHold(AppUtils.HOT_THRESHOLD_HIGH);
+                    break;
+                case ItemManager.NEW_FETCH_MODE:
+                    mAdapter.setHotThresHold(AppUtils.HOT_THRESHOLD_LOW);
+                    break;
+            }
+        } else if (mItemManager == mPopularItemManager) {
+            mAdapter.setHotThresHold(AppUtils.HOT_THRESHOLD_HIGH);
+        }
+        if (mAdapter.getItems() != null) {
+            mAdapter.notifyDataSetChanged();
+        } else {
+            refresh();
+        }
     }
 
     @Override
     public void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        outState.putParcelableArray(EXTRA_ITEMS, mItems);
+        outState.putString(STATE_FILTER, mFilter);
+        outState.putInt(STATE_CACHE_MODE, mCacheMode);
     }
 
     @Override
     public void onDetach() {
-        LocalBroadcastManager.getInstance(getActivity()).unregisterReceiver(mBroadcastReceiver);
-        mBroadcastReceiver = null;
-        mItemOpenListener = null;
+        mPreferenceObservable.unsubscribe(getActivity());
+        mRefreshCallback = null;
         super.onDetach();
     }
 
-    private void bindData() {
-        mItemManager.getStories(mFilter, new ItemManager.ResponseListener<ItemManager.Item[]>() {
-            @Override
-            public void onResponse(final ItemManager.Item[] response) {
-                mItems = response;
-                if (response == null || response.length == 0) {
-                    mEmptyView.setVisibility(View.VISIBLE);
-                    mRecyclerView.setVisibility(View.INVISIBLE);
-                } else {
-                    mEmptyView.setVisibility(View.GONE);
-                    mRecyclerView.setVisibility(View.VISIBLE);
-                }
-                mErrorView.setVisibility(View.GONE);
-                mAdapter.notifyDataSetChanged();
-                mSwipeRefreshLayout.setRefreshing(false);
-            }
-
-            @Override
-            public void onError(String errorMessage) {
-                mSwipeRefreshLayout.setRefreshing(false);
-                if (mItems == null || mItems.length == 0) {
-                    // TODO make refreshing indicator visible in error view
-                    mEmptyView.setVisibility(View.GONE);
-                    mRecyclerView.setVisibility(View.INVISIBLE);
-                    mErrorView.setVisibility(View.VISIBLE);
-                } else {
-                    Toast.makeText(getActivity(), getString(R.string.connection_error),
-                            Toast.LENGTH_SHORT).show();
-                }
-            }
-        });
+    public void filter(String filter) {
+        mFilter = filter;
+        mAdapter.setHighlightUpdated(false);
+        mSwipeRefreshLayout.setRefreshing(true);
+        refresh();
     }
 
-    private class ViewHolder extends ItemRecyclerViewAdapter.ItemViewHolder {
-        private final View mBookmarked;
-        private final TextView mCommentText;
-        private final TextView mRankTextView;
+    @Override
+    protected ListRecyclerViewAdapter getAdapter() {
+        return mAdapter;
+    }
 
-        public ViewHolder(View itemView) {
-            super(itemView);
-            mRankTextView = (TextView) itemView.findViewById(R.id.rank);
-            mBookmarked = itemView.findViewById(R.id.bookmarked);
-            mCommentText = (TextView) mCommentButton.findViewById(R.id.text);
+    private void onPreferenceChanged(int key, boolean contextChanged) {
+        if (!contextChanged) {
+            mAdapter.initDisplayOptions(getActivity());
         }
     }
 
-    private class RecyclerViewAdapter extends ItemRecyclerViewAdapter<ViewHolder, ItemManager.Item> {
-        @Override
-        public ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
-            return new ViewHolder(getLayoutInflater(null)
-                    .inflate(R.layout.item_story, parent, false));
+    private void refresh() {
+        mAdapter.setShowAll(true);
+        mItemManager.getStories(mFilter, mCacheMode, new ListResponseListener(this));
+    }
+
+    @Synthetic
+    void onItemsLoaded(Item[] items) {
+        if (!isAttached()) {
+            return;
         }
-
-        @Override
-        public void onBindViewHolder(final ViewHolder holder, final int position) {
-            holder.mRankTextView.setText(String.valueOf(position + 1));
-            final ItemManager.Item story = getItem(position);
-            if (story.getLocalRevision() < mLocalRevision || mChangedFavorites.contains(story.getId())) {
-                story.setLocalRevision(mLocalRevision);
-                mChangedFavorites.remove(story.getId());
-                FavoriteManager.check(getActivity(), story.getId(),
-                        new FavoriteManager.OperationCallbacks() {
-                            @Override
-                            public void onCheckComplete(boolean isFavorite) {
-                                story.setFavorite(isFavorite);
-                                decorateFavorite(holder, story);
-                            }
-
-                        });
+        if (items == null) {
+            mSwipeRefreshLayout.setRefreshing(false);
+            if (mAdapter.getItems() == null || mAdapter.getItems().isEmpty()) {
+                // TODO make refreshing indicator visible in error view
+                mEmptyView.setVisibility(View.GONE);
+                mRecyclerView.setVisibility(View.INVISIBLE);
+                mErrorView.setVisibility(View.VISIBLE);
             } else {
-                decorateFavorite(holder, story);
+                Toast.makeText(getActivity(), getString(R.string.connection_error),
+                        Toast.LENGTH_SHORT).show();
             }
-            if (!TextUtils.isEmpty(story.getTitle())) {
-                bindViewHolder(holder, story);
+        } else {
+            mAdapter.setItems(new ArrayList<>(Arrays.asList(items)));
+            if (items.length == 0) {
+                mEmptyView.setVisibility(View.VISIBLE);
+                mRecyclerView.setVisibility(View.INVISIBLE);
             } else {
-                clearViewHolder(holder);
-                mItemManager.getItem(story.getId(), new ItemManager.ResponseListener<ItemManager.Item>() {
-                    @Override
-                    public void onResponse(ItemManager.Item response) {
-                        if (response == null) {
-                            return;
-                        }
-
-                        story.populate(response);
-                        bindViewHolder(holder, story);
-                    }
-
-                    @Override
-                    public void onError(String errorMessage) {
-                        // do nothing
-                    }
-                });
+                mEmptyView.setVisibility(View.GONE);
+                mRecyclerView.setVisibility(View.VISIBLE);
             }
-        }
-
-        @Override
-        public int getItemCount() {
-            return mItems.length;
-        }
-
-        @Override
-        protected void onItemSelected(ItemManager.Item item) {
-            mItemOpenListener.onItemOpen(item);
-        }
-
-        @Override
-        protected boolean isSelected(String itemId) {
-            return !TextUtils.isEmpty(mSelectedItemId) && itemId.equals(mSelectedItemId);
-        }
-
-        private void decorateFavorite(ViewHolder holder, ItemManager.Item story) {
-            holder.mBookmarked.setVisibility(story.isFavorite() ? View.VISIBLE : View.INVISIBLE);
-        }
-
-        protected void bindViewHolder(final ViewHolder holder, final ItemManager.Item story) {
-            super.bindViewHolder(holder, story);
-            if (story.getKidCount() > 0) {
-                holder.mCommentText.setText(String.valueOf(story.getKidCount()));
-                holder.mCommentButton.setVisibility(View.VISIBLE);
-            } else {
-                holder.mCommentButton.setVisibility(View.GONE);
+            mErrorView.setVisibility(View.GONE);
+            mSwipeRefreshLayout.setRefreshing(false);
+            if (mRefreshCallback != null) {
+                mRefreshCallback.onRefreshed();
             }
-            holder.itemView.setOnLongClickListener(new View.OnLongClickListener() {
-                @Override
-                public boolean onLongClick(View v) {
-                    final int toastMessageResId;
-                    if (!story.isFavorite()) {
-                        FavoriteManager.add(getActivity(), story);
-                        toastMessageResId = R.string.toast_saved;
-                    } else {
-                        FavoriteManager.remove(getActivity(), story.getId());
-                        toastMessageResId = R.string.toast_removed;
-                    }
-                    Toast.makeText(getActivity(), toastMessageResId, Toast.LENGTH_SHORT).show();
-                    story.setFavorite(!story.isFavorite());
-                    decorateFavorite(holder, story);
-                    return true;
-                }
-            });
-        }
-
-        private ItemManager.Item getItem(int position) {
-            return mItems[position];
         }
     }
 
+    static class ListResponseListener implements ResponseListener<Item[]> {
+        private final WeakReference<ListFragment> mListFragment;
+
+        @Synthetic
+        ListResponseListener(ListFragment listFragment) {
+            mListFragment = new WeakReference<>(listFragment);
+        }
+        @Override
+        public void onResponse(@Nullable final Item[] response) {
+            if (mListFragment.get() != null && mListFragment.get().isAttached()) {
+                mListFragment.get().onItemsLoaded(response);
+            }
+        }
+
+        @Override
+        public void onError(String errorMessage) {
+            if (mListFragment.get() != null && mListFragment.get().isAttached()) {
+                mListFragment.get().onItemsLoaded(null);
+            }
+        }
+    }
 }

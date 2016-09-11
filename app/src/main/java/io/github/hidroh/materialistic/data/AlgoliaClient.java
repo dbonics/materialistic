@@ -1,96 +1,133 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic.data;
 
 import android.content.Context;
-import android.preference.PreferenceManager;
+import android.support.annotation.Keep;
+import android.support.annotation.NonNull;
+import android.text.format.DateUtils;
 
-import io.github.hidroh.materialistic.R;
-import retrofit.Callback;
-import retrofit.RetrofitError;
-import retrofit.client.Response;
-import retrofit.http.GET;
-import retrofit.http.Headers;
-import retrofit.http.Query;
+import java.io.IOException;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+
+import io.github.hidroh.materialistic.ActivityModule;
+import io.github.hidroh.materialistic.Preferences;
+import io.github.hidroh.materialistic.annotation.Synthetic;
+import retrofit2.Call;
+import retrofit2.http.GET;
+import retrofit2.http.Query;
+import rx.Observable;
+import rx.android.schedulers.AndroidSchedulers;
 
 public class AlgoliaClient implements ItemManager {
 
-    private static final String BASE_API_URL = "https://hn.algolia.com/api/v1";
-    private static final Object sLock = new Object();
-    private static AlgoliaClient sInstance;
-    private RestService mRestService;
-    private HackerNewsClient mHackerNewsClient;
-    private boolean mSortByTime = true;
+    public static boolean sSortByTime = true;
+    public static final String HOST = "hn.algolia.com";
+    private static final String BASE_API_URL = "https://" + HOST + "/api/v1/";
+    static final String MIN_CREATED_AT = "created_at_i>";
+    RestService mRestService;
+    @Inject @Named(ActivityModule.HN) ItemManager mHackerNewsClient;
 
-    public static AlgoliaClient getInstance(Context context) {
-        synchronized (sLock) {
-            if (sInstance == null) {
-                sInstance = new AlgoliaClient();
-                sInstance.mRestService = RestServiceFactory.create(context, BASE_API_URL, RestService.class);
-                sInstance.mHackerNewsClient = HackerNewsClient.getInstance(context);
-                sInstance.mSortByTime = PreferenceManager.getDefaultSharedPreferences(context)
-                        .getBoolean(context.getString(R.string.pref_item_search_recent), true);
-            }
-
-            return sInstance;
-        }
-    }
-
-    public void setSortByTime(boolean sortByTime) {
-        mSortByTime = sortByTime;
+    @Inject
+    public AlgoliaClient(Context context, RestServiceFactory factory) {
+        mRestService = factory.rxEnabled(true).create(BASE_API_URL, RestService.class);
+        sSortByTime = Preferences.isSortByRecent(context);
     }
 
     @Override
-    public void getStories(String filter, final ResponseListener<Item[]> listener) {
-        Callback<AlgoliaHits> callback = new Callback<AlgoliaHits>() {
-            @Override
-            public void success(AlgoliaHits algoliaHits, Response response) {
-                if (listener == null) {
-                    return;
-                }
+    public void getStories(String filter, @CacheMode int cacheMode,
+                           final ResponseListener<Item[]> listener) {
+        if (listener == null) {
+            return;
+        }
+        search(filter)
+                .map(this::toItems)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(listener::onResponse,
+                        t -> listener.onError(t != null ? t.getMessage() : ""));
+    }
 
-                Hit[] hits = algoliaHits.hits;
-                Item[] stories = new Item[hits == null ? 0 : hits.length];
-                for (int i = 0; i < stories.length; i++) {
-                    stories[i] = new HackerNewsClient.HackerNewsItem(Long.parseLong(hits[i].objectID));
-                }
-                listener.onResponse(stories);
-            }
+    @Override
+    public void getItem(String itemId, @CacheMode int cacheMode, ResponseListener<Item> listener) {
+        mHackerNewsClient.getItem(itemId, cacheMode, listener);
+    }
 
-            @Override
-            public void failure(RetrofitError error) {
-                if (listener == null) {
-                    return;
-                }
-
-                listener.onError(error == null ? error.getMessage() : "");
-            }
-        };
-        if (mSortByTime) {
-            mRestService.searchByDate(filter, callback);
-        } else {
-            mRestService.search(filter, callback);
+    @Override
+    public Item[] getStories(String filter, @CacheMode int cacheMode) {
+        long timestamp = System.currentTimeMillis() - DateUtils.DAY_IN_MILLIS; // since yesterday
+        try {
+            return toItems(mRestService.search(filter, MIN_CREATED_AT + timestamp / 1000)
+                    .execute()
+                    .body());
+        } catch (IOException e) {
+            return new Item[0];
         }
     }
 
     @Override
-    public void getItem(String itemId, ResponseListener<Item> listener) {
-        mHackerNewsClient.getItem(itemId, listener);
+    public Item getItem(String itemId, @CacheMode int cacheMode) {
+        return mHackerNewsClient.getItem(itemId, cacheMode);
     }
 
-    private static interface RestService {
-        @Headers("Cache-Control: max-age=600")
-        @GET("/search_by_date?hitsPerPage=100&tags=story&attributesToRetrieve=objectID&attributesToHighlight=none")
-        void searchByDate(@Query("query") String query, Callback<AlgoliaHits> callback);
-
-        @Headers("Cache-Control: max-age=600")
-        @GET("/search?hitsPerPage=100&tags=story&attributesToRetrieve=objectID&attributesToHighlight=none")
-        void search(@Query("query") String query, Callback<AlgoliaHits> callback);
+    protected Observable<AlgoliaHits> search(String filter) {
+        // TODO add ETag header
+        return sSortByTime ? mRestService.searchByDate(filter) : mRestService.search(filter);
     }
 
-    private class AlgoliaHits {
-        private Hit[] hits;
+    @NonNull
+    private Item[] toItems(AlgoliaHits algoliaHits) {
+        if (algoliaHits == null) {
+            return new Item[0];
+        }
+        Hit[] hits = algoliaHits.hits;
+        Item[] stories = new Item[hits == null ? 0 : hits.length];
+        for (int i = 0; i < stories.length; i++) {
+            //noinspection ConstantConditions
+            HackerNewsItem item = new HackerNewsItem(
+                    Long.parseLong(hits[i].objectID));
+            item.rank = i + 1;
+            stories[i] = item;
+        }
+        return stories;
     }
 
-    private class Hit {
-        private String objectID;
+    interface RestService {
+        @GET("search_by_date?hitsPerPage=100&tags=story&attributesToRetrieve=objectID&attributesToHighlight=none")
+        Observable<AlgoliaHits> searchByDate(@Query("query") String query);
+
+        @GET("search?hitsPerPage=100&tags=story&attributesToRetrieve=objectID&attributesToHighlight=none")
+        Observable<AlgoliaHits> search(@Query("query") String query);
+
+        @GET("search?hitsPerPage=100&tags=story&attributesToRetrieve=objectID&attributesToHighlight=none")
+        Observable<AlgoliaHits> searchByMinTimestamp(@Query("numericFilters") String timestampSeconds);
+
+        @GET("search?hitsPerPage=10&tags=story&attributesToRetrieve=objectID&attributesToHighlight=none")
+        Call<AlgoliaHits> search(@Query("query") String query, @Query("numericFilters") String timestampSeconds);
+    }
+
+    static class AlgoliaHits {
+        @Keep @Synthetic
+        Hit[] hits;
+    }
+
+    static class Hit {
+        @Keep @Synthetic
+        String objectID;
     }
 }

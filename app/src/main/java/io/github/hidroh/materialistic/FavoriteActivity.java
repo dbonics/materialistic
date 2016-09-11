@@ -1,43 +1,95 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic;
 
 import android.app.SearchManager;
 import android.content.Intent;
+import android.database.ContentObserver;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
 import android.support.v4.app.Fragment;
 import android.text.TextUtils;
-import android.view.View;
 
-public class FavoriteActivity extends BaseListActivity implements FavoriteFragment.DataChangedListener {
+import io.github.hidroh.materialistic.data.FavoriteManager;
+import io.github.hidroh.materialistic.data.ItemManager;
+import io.github.hidroh.materialistic.data.MaterialisticProvider;
+import io.github.hidroh.materialistic.data.WebItem;
 
-    private FavoriteFragment mFavoriteFragment;
-    private View mEmptyView;
-    private View mEmptySearchView;
-    private boolean mIsEmpty;
+public class FavoriteActivity extends BaseListActivity {
+
+    static final String EMPTY_QUERY = MaterialisticProvider.class.getName();
+    private static final String STATE_FILTER = "state:filter";
+    private final ContentObserver mObserver = new ContentObserver(new Handler()) {
+        @Override
+        public void onChange(boolean selfChange, Uri uri) {
+            if (FavoriteManager.isRemoved(uri)) {
+                WebItem selected = getSelectedItem();
+                if (selected != null &&
+                        TextUtils.equals(selected.getId(), uri.getLastPathSegment())) {
+                    onItemSelected(null);
+                }
+            } else if (FavoriteManager.isCleared(uri)) {
+                onItemSelected(null);
+            }
+        }
+    };
     private String mFilter;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        if (savedInstanceState != null) {
+            mFilter = savedInstanceState.getString(STATE_FILTER);
+            getSupportActionBar().setSubtitle(mFilter);
+        }
+        getContentResolver().registerContentObserver(MaterialisticProvider.URI_FAVORITE,
+                true, mObserver);
+    }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        if (mFavoriteFragment != null) {
-            mFavoriteFragment.filter(intent.getStringExtra(SearchManager.QUERY));
+        if (!intent.hasExtra(SearchManager.QUERY)) {
+            return;
+        }
+        onItemSelected(null);
+        mFilter = intent.getStringExtra(SearchManager.QUERY);
+        if (TextUtils.equals(mFilter, EMPTY_QUERY)) {
+            mFilter = null;
+        }
+        getSupportActionBar().setSubtitle(mFilter);
+        FavoriteFragment fragment = (FavoriteFragment) getSupportFragmentManager()
+                .findFragmentByTag(LIST_FRAGMENT_TAG);
+        if (fragment != null) {
+            fragment.filter(mFilter);
         }
     }
 
     @Override
-    protected void onCreateView() {
-        mEmptyView = getLayoutInflater().inflate(R.layout.empty_favorite, mContentView, false);
-        mEmptyView.findViewById(R.id.header_card_view).setOnLongClickListener(new View.OnLongClickListener() {
-            @Override
-            public boolean onLongClick(View v) {
-                final View bookmark = mEmptyView.findViewById(R.id.bookmarked);
-                bookmark.setVisibility(bookmark.getVisibility() == View.VISIBLE ? View.INVISIBLE : View.VISIBLE);
-                return true;
-            }
-        });
-        mEmptyView.setVisibility(View.INVISIBLE);
-        mContentView.addView(mEmptyView);
-        mEmptySearchView = getLayoutInflater().inflate(R.layout.empty_favorite_search, mContentView, false);
-        mEmptySearchView.setVisibility(View.INVISIBLE);
-        mContentView.addView(mEmptySearchView);
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putString(STATE_FILTER, mFilter);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        getContentResolver().unregisterContentObserver(mObserver);
     }
 
     @Override
@@ -47,13 +99,9 @@ public class FavoriteActivity extends BaseListActivity implements FavoriteFragme
 
     @Override
     protected Fragment instantiateListFragment() {
-        mFavoriteFragment = FavoriteFragment.instantiate(this, mFilter);
-        return mFavoriteFragment;
-    }
-
-    @Override
-    protected boolean isItemOptionsMenuVisible() {
-        return mSelectedItem != null && !mIsEmpty;
+        Bundle args = new Bundle();
+        args.putString(FavoriteFragment.EXTRA_FILTER, mFilter);
+        return Fragment.instantiate(this, FavoriteFragment.class.getName(), args);
     }
 
     @Override
@@ -62,24 +110,7 @@ public class FavoriteActivity extends BaseListActivity implements FavoriteFragme
     }
 
     @Override
-    public void onDataChanged(boolean isEmpty, String filter) {
-        mFilter = filter;
-        mIsEmpty = isEmpty;
-        if (isEmpty) {
-            if (TextUtils.isEmpty(filter)) {
-                mEmptySearchView.setVisibility(View.INVISIBLE);
-                mEmptyView.setVisibility(View.VISIBLE);
-                mEmptyView.bringToFront();
-            } else {
-                mEmptyView.setVisibility(View.INVISIBLE);
-                mEmptySearchView.setVisibility(View.VISIBLE);
-                mEmptySearchView.bringToFront();
-            }
-        } else {
-            mEmptyView.setVisibility(View.INVISIBLE);
-            mEmptySearchView.setVisibility(View.INVISIBLE);
-        }
-
-        supportInvalidateOptionsMenu();
+    protected int getItemCacheMode() {
+        return ItemManager.MODE_CACHE;
     }
 }

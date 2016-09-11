@@ -1,221 +1,445 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic;
 
-import android.content.res.Configuration;
-import android.os.Build;
+import android.app.SearchManager;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.Bundle;
-import android.preference.PreferenceManager;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
+import android.support.design.widget.AppBarLayout;
+import android.support.design.widget.FloatingActionButton;
+import android.support.design.widget.TabLayout;
 import android.support.v4.app.Fragment;
 import android.support.v4.app.FragmentTransaction;
-import android.support.v4.view.MenuItemCompat;
-import android.support.v7.widget.ShareActionProvider;
+import android.support.v4.content.LocalBroadcastManager;
+import android.support.v7.app.ActionBar;
+import android.support.v7.widget.SearchView;
+import android.support.v7.widget.Toolbar;
+import android.text.TextUtils;
+import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
-import android.view.Window;
-import android.widget.RelativeLayout;
 
+import javax.inject.Inject;
+
+import io.github.hidroh.materialistic.annotation.Synthetic;
 import io.github.hidroh.materialistic.data.ItemManager;
+import io.github.hidroh.materialistic.data.SessionManager;
+import io.github.hidroh.materialistic.data.WebItem;
+import io.github.hidroh.materialistic.widget.ItemPagerAdapter;
+import io.github.hidroh.materialistic.widget.NavFloatingActionButton;
+import io.github.hidroh.materialistic.widget.PopupMenu;
+import io.github.hidroh.materialistic.widget.ViewPager;
 
 /**
  * List activity that renders alternative layouts for portrait/landscape
  */
-public abstract class BaseListActivity extends BaseActivity implements ItemOpenListener {
+public abstract class BaseListActivity extends DrawerActivity implements MultiPaneListener {
 
-    private static final String LIST_FRAGMENT_TAG = BaseListActivity.class.getName() + ".LIST_FRAGMENT_TAG";
+    protected static final String LIST_FRAGMENT_TAG = BaseListActivity.class.getName() +
+            ".LIST_FRAGMENT_TAG";
+    private static final String STATE_SELECTED_ITEM = "state:selectedItem";
+    private static final String STATE_STORY_VIEW_MODE = "state:storyViewMode";
+    private static final String STATE_EXTERNAL_BROWSER = "state:externalBrowser";
+    private static final String STATE_FULLSCREEN = "state:fullscreen";
+    private static final String STATE_MULTI_WINDOW_ENABLED = "state:multiWindowEnabled";
     private boolean mIsMultiPane;
-    private WebFragment mWebFragment;
-    private ItemFragment mItemFragment;
-    private boolean mIsStoryMode = true;
-    private boolean mIsResumed;
-    protected ItemManager.WebItem mSelectedItem;
+    protected WebItem mSelectedItem;
+    private Preferences.StoryViewMode mStoryViewMode;
+    private boolean mExternalBrowser;
+    private ViewPager mViewPager;
+    @Inject ActionViewResolver mActionViewResolver;
+    @Inject PopupMenu mPopupMenu;
+    @Inject SessionManager mSessionManager;
+    @Inject CustomTabsDelegate mCustomTabsDelegate;
+    @Inject KeyDelegate mKeyDelegate;
+    private AppBarLayout mAppBar;
+    private TabLayout mTabLayout;
+    private FloatingActionButton mReplyButton;
+    private NavFloatingActionButton mNavButton;
+    private View mListView;
+    @Synthetic boolean mFullscreen;
+    private boolean mMultiWindowEnabled;
+    private final Preferences.Observable mPreferenceObservable = new Preferences.Observable();
+    private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            mFullscreen = intent.getBooleanExtra(BaseWebFragment.EXTRA_FULLSCREEN, false);
+            setFullscreen();
+        }
+    };
+    private ItemPagerAdapter mAdapter;
 
+    @SuppressWarnings("ConstantConditions")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            getWindow().requestFeature(Window.FEATURE_CONTENT_TRANSITIONS);
-        }
         super.onCreate(savedInstanceState);
-        setTitle(getDefaultTitle());
         setContentView(R.layout.activity_list);
-        onCreateView();
-        beginFragmentTransaction()
-                .replace(android.R.id.list,
-                        instantiateListFragment(),
-                        LIST_FRAGMENT_TAG)
-                .commit();
+        setTitle(getDefaultTitle());
+        setSupportActionBar((Toolbar) findViewById(R.id.toolbar));
+        getSupportActionBar().setDisplayOptions(ActionBar.DISPLAY_SHOW_HOME |
+                ActionBar.DISPLAY_HOME_AS_UP | ActionBar.DISPLAY_SHOW_TITLE);
+        findViewById(R.id.toolbar).setOnClickListener(v -> {
+            Scrollable scrollable = getScrollableList();
+            if (scrollable != null) {
+                scrollable.scrollToTop();
+            }
+        });
+        mAppBar = (AppBarLayout) findViewById(R.id.appbar);
+        mIsMultiPane = getResources().getBoolean(R.bool.multi_pane);
+        if (mIsMultiPane) {
+            LocalBroadcastManager.getInstance(this).registerReceiver(mReceiver,
+                    new IntentFilter(BaseWebFragment.ACTION_FULLSCREEN));
+            mListView = findViewById(android.R.id.list);
+            mTabLayout = (TabLayout) findViewById(R.id.tab_layout);
+            mTabLayout.setVisibility(View.GONE);
+            mViewPager = (ViewPager) findViewById(R.id.content);
+            mViewPager.setVisibility(View.GONE);
+            mReplyButton = (FloatingActionButton) findViewById(R.id.reply_button);
+            mNavButton = (NavFloatingActionButton) findViewById(R.id.navigation_button);
+            mNavButton.setNavigable(direction ->
+                    // if callback is fired navigable should not be null
+                    ((Navigable) ((ItemPagerAdapter) mViewPager.getAdapter()).getItem(0))
+                            .onNavigate(direction));
+            AppUtils.toggleFab(mNavButton, false);
+            AppUtils.toggleFab(mReplyButton, false);
+        }
+        if (savedInstanceState == null) {
+            mMultiWindowEnabled = Preferences.multiWindowEnabled(this);
+            mStoryViewMode = Preferences.getDefaultStoryView(this);
+            mExternalBrowser = Preferences.externalBrowserEnabled(this);
+            getSupportFragmentManager()
+                    .beginTransaction()
+                    .replace(android.R.id.list,
+                            instantiateListFragment(),
+                            LIST_FRAGMENT_TAG)
+                    .commit();
+        } else {
+            mMultiWindowEnabled = savedInstanceState.getBoolean(STATE_MULTI_WINDOW_ENABLED);
+            mStoryViewMode = Preferences.StoryViewMode.values()[
+                    savedInstanceState.getInt(STATE_STORY_VIEW_MODE, 0)];
+            mExternalBrowser = savedInstanceState.getBoolean(STATE_EXTERNAL_BROWSER);
+            mSelectedItem = savedInstanceState.getParcelable(STATE_SELECTED_ITEM);
+            mFullscreen = savedInstanceState.getBoolean(STATE_FULLSCREEN);
+            if (mIsMultiPane) {
+                openMultiPaneItem();
+            } else {
+                unbindViewPager();
+            }
+        }
+        mPreferenceObservable.subscribe(this, this::onPreferenceChanged,
+                R.string.pref_navigation,
+                R.string.pref_external,
+                R.string.pref_story_display,
+                R.string.pref_multi_window);
     }
 
     @Override
-    public void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        handleConfigurationChanged();
+    protected void onPostCreate(Bundle savedInstanceState) {
+        super.onPostCreate(savedInstanceState);
+        if (!Preferences.isReleaseNotesSeen(this)) {
+            startActivity(new Intent(this, ReleaseNotesActivity.class));
+        }
     }
 
     @Override
-    protected void onPostResume() {
-        super.onPostResume();
-        mIsResumed = true;
-        handleConfigurationChanged();
-    }
-
-    @Override
-    protected void onPause() {
-        mIsResumed = false;
-        super.onPause();
+    protected void onStart() {
+        super.onStart();
+        mCustomTabsDelegate.bindCustomTabsService(this);
+        mKeyDelegate.attach(this);
     }
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
-        if (!getResources().getBoolean(R.bool.multi_pane)) {
-            return super.onCreateOptionsMenu(menu);
+        if (mIsMultiPane) {
+            getMenuInflater().inflate(R.menu.menu_item, menu);
         }
-
-        getMenuInflater().inflate(R.menu.menu_list_land, menu);
+        if (isSearchable()) {
+            getMenuInflater().inflate(R.menu.menu_search, menu);
+            MenuItem menuSearch = menu.findItem(R.id.menu_search);
+            SearchManager searchManager = (SearchManager) getSystemService(Context.SEARCH_SERVICE);
+            SearchView searchView = (SearchView) mActionViewResolver.getActionView(menuSearch);
+            searchView.setSearchableInfo(searchManager.getSearchableInfo(
+                    new ComponentName(this, SearchActivity.class)));
+            searchView.setIconified(true);
+            searchView.setQuery("", false);
+        }
         return super.onCreateOptionsMenu(menu);
     }
 
     @Override
     public boolean onPrepareOptionsMenu(Menu menu) {
-        if (!getResources().getBoolean(R.bool.multi_pane)) {
-            return super.onPrepareOptionsMenu(menu);
+        if (mIsMultiPane) {
+            menu.findItem(R.id.menu_share).setVisible(mSelectedItem != null);
+            menu.findItem(R.id.menu_external).setVisible(mSelectedItem != null);
         }
-
-        menu.findItem(R.id.menu_comment).setVisible(mIsStoryMode && isItemOptionsMenuVisible());
-        menu.findItem(R.id.menu_story).setVisible(!mIsStoryMode && isItemOptionsMenuVisible());
-        menu.findItem(R.id.menu_share).setVisible(isItemOptionsMenuVisible());
-        if (mSelectedItem != null && mSelectedItem.isShareable()) {
-            ShareActionProvider shareActionProvider = (ShareActionProvider) MenuItemCompat.getActionProvider(
-                    menu.findItem(R.id.menu_share));
-            shareActionProvider.setShareIntent(AppUtils.makeShareIntent(
-                    getString(R.string.share_format,
-                            mSelectedItem.getDisplayedTitle(),
-                            mSelectedItem.getUrl())));
-        }
-        return super.onPrepareOptionsMenu(menu);
+        return isSearchable() || super.onPrepareOptionsMenu(menu);
     }
 
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
-        if (item.getItemId() == R.id.menu_comment) {
-            openComment(beginToggleFragmentTransaction());
+        if (item.getItemId() == R.id.menu_share) {
+            View anchor = findViewById(R.id.menu_share);
+            AppUtils.share(this, mPopupMenu, anchor == null ?
+                    findViewById(R.id.toolbar) : anchor, mSelectedItem);
             return true;
         }
-
-        if (item.getItemId() == R.id.menu_story) {
-            openStory(beginToggleFragmentTransaction());
+        if (item.getItemId() == R.id.menu_external) {
+            View anchor = findViewById(R.id.menu_external);
+            AppUtils.openExternal(this, mPopupMenu, anchor == null ?
+                    findViewById(R.id.toolbar) : anchor,
+                    mSelectedItem, mCustomTabsDelegate.getSession());
             return true;
         }
-
         return super.onOptionsItemSelected(item);
     }
 
     @Override
-    public void onItemOpen(ItemManager.WebItem item) {
-        FragmentTransaction transaction = beginSwapFragmentTransaction();
-        removeFragment(transaction, WebFragment.class.getName());
-        removeFragment(transaction, ItemFragment.class.getName());
-        if (item == null) {
-            setTitle(getDefaultTitle());
-            transaction.commit();
-            mSelectedItem = null;
-            findViewById(R.id.empty).setVisibility(View.VISIBLE);
-        } else {
-            if (mIsMultiPane) {
-                setTitle(item.getDisplayedTitle());
-            }
-            mSelectedItem = item;
-            findViewById(R.id.empty).setVisibility(View.GONE);
-            mWebFragment = WebFragment.instantiate(this, item);
-            Bundle args = new Bundle();
-            args.putInt(ItemFragment.EXTRA_MARGIN,
-                    getResources().getDimensionPixelSize(R.dimen.activity_horizontal_margin));
-            mItemFragment = ItemFragment.instantiate(this, item, args);
-            transaction
-                    .add(R.id.content, mItemFragment, ItemFragment.class.getName())
-                    .add(R.id.content, mWebFragment, WebFragment.class.getName());
-            if (PreferenceManager.getDefaultSharedPreferences(this)
-                    .getBoolean(getString(R.string.pref_item_click), false)) {
-                openComment(transaction);
-            } else {
-                openStory(transaction);
-            }
-        }
-        supportInvalidateOptionsMenu();
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putParcelable(STATE_SELECTED_ITEM, mSelectedItem);
+        outState.putInt(STATE_STORY_VIEW_MODE, mStoryViewMode.ordinal());
+        outState.putBoolean(STATE_EXTERNAL_BROWSER, mExternalBrowser);
+        outState.putBoolean(STATE_FULLSCREEN, mFullscreen);
+        outState.putBoolean(STATE_MULTI_WINDOW_ENABLED, mMultiWindowEnabled);
     }
 
     @Override
+    protected void onStop() {
+        super.onStop();
+        mCustomTabsDelegate.unbindCustomTabsService(this);
+        mKeyDelegate.detach(this);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        mPreferenceObservable.unsubscribe(this);
+        if (mIsMultiPane) {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(mReceiver);
+        }
+    }
+    @Override
+    public void onBackPressed() {
+        if (!mIsMultiPane || !mFullscreen) {
+            super.onBackPressed();
+        } else {
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(
+                    WebFragment.ACTION_FULLSCREEN).putExtra(WebFragment.EXTRA_FULLSCREEN, false));
+        }
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        mKeyDelegate.setScrollable(getScrollableList(), mAppBar);
+        mKeyDelegate.setBackInterceptor(getBackInterceptor());
+        return mKeyDelegate.onKeyDown(keyCode, event) ||
+                super.onKeyDown(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        return mKeyDelegate.onKeyUp(keyCode, event) ||
+                super.onKeyUp(keyCode, event);
+    }
+
+    @Override
+    public boolean onKeyLongPress(int keyCode, KeyEvent event) {
+        return mKeyDelegate.onKeyLongPress(keyCode, event) ||
+                super.onKeyLongPress(keyCode, event);
+    }
+
+    @NonNull
+    @Override
+    public ActionBar getSupportActionBar() {
+        //noinspection ConstantConditions
+        return super.getSupportActionBar();
+    }
+
+    @Override
+    public void onItemSelected(@Nullable WebItem item) {
+        WebItem previousItem = mSelectedItem;
+        mSelectedItem = item;
+        if (mIsMultiPane) {
+            if (previousItem != null && item != null &&
+                    TextUtils.equals(item.getId(), previousItem.getId())) {
+                return;
+            }
+            if (previousItem == null && item != null ||
+                    previousItem != null && item == null) {
+                supportInvalidateOptionsMenu();
+            }
+            openMultiPaneItem();
+        } else if (item != null) {
+            openSinglePaneItem();
+        }
+    }
+
+    @Override
+    public WebItem getSelectedItem() {
+        return mSelectedItem;
+    }
+
+    @Override
+    public boolean isMultiPane() {
+        return mIsMultiPane;
+    }
+
+    /**
+     * Checks if activity should have search view
+     * @return true if is searchable, false otherwise
+     */
     protected boolean isSearchable() {
         return true;
     }
 
     /**
      * Gets default title to be displayed in list-only layout
-     * @return
+     * @return displayed title
      */
     protected abstract String getDefaultTitle();
 
     /**
      * Creates list fragment to host list data
-     * @return
+     * @return list fragment
      */
     protected abstract Fragment instantiateListFragment();
 
     /**
-     * Checks if item options menu should be displayed
-     * @return  true to display item options menu, false otherwise
+     * Gets cache mode for {@link ItemManager}
+     * @return  cache mode
      */
-    protected abstract boolean isItemOptionsMenuVisible();
+    @ItemManager.CacheMode
+    protected int getItemCacheMode() {
+        return ItemManager.MODE_DEFAULT;
+    }
 
-    /**
-     * Recreates view on first load or on orientation change that triggers layout change
-     */
-    protected void onCreateView() {}
+    @Synthetic
+    void setFullscreen() {
+        mAppBar.setExpanded(!mFullscreen, true);
+        mTabLayout.setVisibility(mFullscreen ? View.GONE : View.VISIBLE);
+        mListView.setVisibility(mFullscreen ? View.GONE : View.VISIBLE);
+        mKeyDelegate.setAppBarEnabled(!mFullscreen);
+        mViewPager.setSwipeEnabled(!mFullscreen);
+        AppUtils.toggleFab(mReplyButton, !mFullscreen);
+    }
 
-    private void handleConfigurationChanged() {
-        if (!mIsResumed) {
-            return;
+    private Scrollable getScrollableList() {
+        // TODO landscape behavior?
+        return (Scrollable) getSupportFragmentManager().findFragmentByTag(LIST_FRAGMENT_TAG);
+    }
+
+    private KeyDelegate.BackInterceptor getBackInterceptor() {
+        if (mViewPager == null ||
+                mViewPager.getAdapter() == null ||
+                mViewPager.getCurrentItem() < 0) {
+            return null;
         }
+        Fragment item = ((ItemPagerAdapter) mViewPager.getAdapter())
+                .getItem(mViewPager.getCurrentItem());
+        if (item instanceof KeyDelegate.BackInterceptor) {
+            return (KeyDelegate.BackInterceptor) item;
+        } else {
+            return null;
+        }
+    }
 
-        // only recreate view if orientation change triggers layout change
-        if (mIsMultiPane != getResources().getBoolean(R.bool.multi_pane)) {
-            mIsMultiPane = getResources().getBoolean(R.bool.multi_pane);
-            final RelativeLayout.LayoutParams params;
-            if (mIsMultiPane) {
-                params = new RelativeLayout.LayoutParams(
-                        getResources().getDimensionPixelSize(R.dimen.list_width),
-                        RelativeLayout.LayoutParams.MATCH_PARENT);
-            } else {
-                setTitle(getDefaultTitle());
-                params = new RelativeLayout.LayoutParams(
-                        RelativeLayout.LayoutParams.MATCH_PARENT,
-                        RelativeLayout.LayoutParams.MATCH_PARENT);
+    private void openSinglePaneItem() {
+        if (mExternalBrowser) {
+            AppUtils.openWebUrlExternal(this, mSelectedItem, mSelectedItem.getUrl(), mCustomTabsDelegate.getSession());
+        } else {
+            Intent intent = new Intent(this, ItemActivity.class)
+                    .putExtra(ItemActivity.EXTRA_CACHE_MODE, getItemCacheMode())
+                    .putExtra(ItemActivity.EXTRA_ITEM, mSelectedItem);
+            startActivity(mMultiWindowEnabled ? AppUtils.multiWindowIntent(this, intent) : intent);
+        }
+    }
+
+    private void openMultiPaneItem() {
+        if (mSelectedItem == null) {
+            setTitle(getDefaultTitle());
+            findViewById(R.id.empty_selection).setVisibility(View.VISIBLE);
+            mTabLayout.setVisibility(View.GONE);
+            mViewPager.setVisibility(View.GONE);
+            mViewPager.setAdapter(null);
+            AppUtils.toggleFab(mNavButton, false);
+            AppUtils.toggleFab(mReplyButton, false);
+        } else {
+            setTitle(mSelectedItem.getDisplayedTitle());
+            findViewById(R.id.empty_selection).setVisibility(View.GONE);
+            mTabLayout.setVisibility(View.VISIBLE);
+            mViewPager.setVisibility(View.VISIBLE);
+            bindViewPager();
+            mSessionManager.view(this, mSelectedItem.getId());
+        }
+    }
+
+    private void bindViewPager() {
+        if (mAdapter != null) {
+            mAdapter.unbind(mTabLayout);
+        }
+        mAdapter = new ItemPagerAdapter(this, getSupportFragmentManager(), new ItemPagerAdapter.Builder()
+                .setItem(mSelectedItem)
+                .setShowArticle(true)
+                .setCacheMode(getItemCacheMode())
+                .setDefaultViewMode(mStoryViewMode));
+        mAdapter.bind(mViewPager, mTabLayout, mNavButton, mReplyButton);
+        if (mFullscreen) {
+            setFullscreen();
+        }
+    }
+
+    private void unbindViewPager() {
+        // fragment manager always restores view pager fragments,
+        // even when view pager no longer exists (e.g. after rotation),
+        // so we have to explicitly remove those with view pager ID
+        FragmentTransaction transaction = getSupportFragmentManager().beginTransaction();
+        //noinspection Convert2streamapi
+        for (Fragment fragment : getSupportFragmentManager().getFragments()) {
+            if (fragment != null && fragment.getId() == R.id.content) {
+                transaction.remove(fragment);
             }
-            findViewById(android.R.id.list).setLayoutParams(params);
-            onItemOpen(null);
         }
+        transaction.commit();
     }
 
-    private void openStory(FragmentTransaction transaction) {
-        transaction.hide(mItemFragment).show(mWebFragment).commit();
-        mIsStoryMode = true;
-        supportInvalidateOptionsMenu();
-    }
-
-    private void openComment(FragmentTransaction transaction) {
-        transaction.hide(mWebFragment).show(mItemFragment).commit();
-        mIsStoryMode = false;
-        supportInvalidateOptionsMenu();
-    }
-
-    private FragmentTransaction beginSwapFragmentTransaction() {
-        final FragmentTransaction transaction = beginFragmentTransaction();
-        transaction.setCustomAnimations(android.R.anim.fade_in, android.R.anim.fade_out);
-        return transaction;
-    }
-
-    private FragmentTransaction beginToggleFragmentTransaction() {
-        final FragmentTransaction transaction = beginFragmentTransaction();
-        transaction.setCustomAnimations(R.anim.slide_in_right, R.anim.slide_out_right);
-        return transaction;
+    private void onPreferenceChanged(int key, boolean contextChanged) {
+        switch (key) {
+            case R.string.pref_external:
+                mExternalBrowser = Preferences.externalBrowserEnabled(this);
+                break;
+            case R.string.pref_story_display:
+                mStoryViewMode = Preferences.getDefaultStoryView(this);
+                break;
+            case R.string.pref_navigation:
+                if (mNavButton != null) {
+                    AppUtils.toggleFab(mNavButton, mViewPager.getCurrentItem() == 0 &&
+                            Preferences.navigationEnabled(this));
+                }
+                break;
+            case R.string.pref_multi_window:
+                mMultiWindowEnabled = Preferences.multiWindowEnabled(this);
+                break;
+        }
     }
 }

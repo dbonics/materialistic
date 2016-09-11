@@ -1,238 +1,297 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic;
 
 import android.content.Context;
-import android.content.Intent;
 import android.os.Bundle;
+import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
-import android.support.v4.app.ActivityCompat;
-import android.support.v4.app.ActivityOptionsCompat;
+import android.support.v4.app.DialogFragment;
 import android.support.v4.app.Fragment;
-import android.support.v7.widget.LinearLayoutManager;
+import android.support.v4.widget.SwipeRefreshLayout;
 import android.support.v7.widget.RecyclerView;
+import android.text.TextUtils;
 import android.view.LayoutInflater;
+import android.view.Menu;
+import android.view.MenuInflater;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.LinearLayout;
-import android.widget.RelativeLayout;
-import android.widget.TextView;
 
-import io.github.hidroh.materialistic.data.HackerNewsClient;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Arrays;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+
+import io.github.hidroh.materialistic.annotation.Synthetic;
+import io.github.hidroh.materialistic.data.Item;
 import io.github.hidroh.materialistic.data.ItemManager;
+import io.github.hidroh.materialistic.data.ResponseListener;
+import io.github.hidroh.materialistic.data.WebItem;
+import io.github.hidroh.materialistic.widget.CommentItemDecoration;
+import io.github.hidroh.materialistic.widget.ItemRecyclerViewAdapter;
+import io.github.hidroh.materialistic.widget.MultiPageItemRecyclerViewAdapter;
+import io.github.hidroh.materialistic.widget.SinglePageItemRecyclerViewAdapter;
+import io.github.hidroh.materialistic.widget.SnappyLinearLayoutManager;
 
-public class ItemFragment extends Fragment {
+public class ItemFragment extends LazyLoadFragment implements Scrollable, Navigable {
 
-    public static final String EXTRA_MARGIN = ItemFragment.class.getName() + ".EXTRA_MARGIN";
-    private static final String EXTRA_ITEM = ItemFragment.class.getName() + ".EXTRA_ITEM";
+    public static final String EXTRA_ITEM = ItemFragment.class.getName() + ".EXTRA_ITEM";
+    public static final String EXTRA_CACHE_MODE = ItemFragment.class.getName() + ".EXTRA_CACHE_MODE";
+    private static final String STATE_ITEM = "state:item";
+    private static final String STATE_ITEM_ID = "state:itemId";
+    private static final String STATE_ADAPTER_ITEMS = "state:adapterItems";
+    private static final String STATE_CACHE_MODE = "state:cacheMode";
     private RecyclerView mRecyclerView;
     private View mEmptyView;
-    private ItemManager.Item mItem;
-    private int mLocalRevision = 0;
-    private boolean mIsResumed;
+    private Item mItem;
+    private String mItemId;
+    @Inject @Named(ActivityModule.HN) ItemManager mItemManager;
+    private SwipeRefreshLayout mSwipeRefreshLayout;
+    private SinglePageItemRecyclerViewAdapter.SavedState mAdapterItems;
+    private ItemRecyclerViewAdapter mAdapter;
+    private KeyDelegate.RecyclerViewHelper mScrollableHelper;
+    private @ItemManager.CacheMode int mCacheMode = ItemManager.MODE_DEFAULT;
+    private final Preferences.Observable mPreferenceObservable = new Preferences.Observable();
+    private CommentItemDecoration mItemDecoration;
 
-    /**
-     * Instantiates fragment to display given web item (with missing kid data)
-     * @param context   an instance of {@link android.content.Context}
-     * @param item      web item to display
-     * @param args      fragment arguments or null
-     * @return  item fragment
-     */
-    public static ItemFragment instantiate(Context context, ItemManager.WebItem item, Bundle args) {
-        if (item instanceof ItemManager.Item) {
-            return instantiate(context, (ItemManager.Item) item, args);
-        } else {
-            final ItemFragment fragment = (ItemFragment) instantiate(context, ItemFragment.class.getName(), args);
-            HackerNewsClient.getInstance(context).getItem(item.getId(),
-                    new ItemManager.ResponseListener<ItemManager.Item>() {
-                        @Override
-                        public void onResponse(ItemManager.Item response) {
-                            if (!fragment.mIsResumed) {
-                                return;
-                            }
-
-                            fragment.mItem = response;
-                            fragment.bindKidData(fragment.mItem.getKidItems(), null);
-                        }
-
-                        @Override
-                        public void onError(String errorMessage) {
-                            // do nothing
-                        }
-                    });
-            return fragment;
-        }
-    }
-
-    /**
-     * Instantiates fragment to display given item
-     * @param context   an instance of {@link android.content.Context}
-     * @param item      item to display
-     * @param args      fragment arguments or null
-     * @return  item fragment
-     */
-    public static ItemFragment instantiate(Context context, ItemManager.Item item, Bundle args) {
-        final ItemFragment fragment = (ItemFragment) Fragment.instantiate(context,
-                ItemFragment.class.getName(), args == null ? new Bundle() : args);
-        fragment.mItem = item;
-        return fragment;
+    @Override
+    public void onAttach(Context context) {
+        super.onAttach(context);
+        mPreferenceObservable.subscribe(context, this::onPreferenceChanged,
+                R.string.pref_comment_display,
+                R.string.pref_max_lines,
+                R.string.pref_username,
+                R.string.pref_line_height,
+                R.string.pref_color_code,
+                R.string.pref_thread_indicator,
+                R.string.pref_font,
+                R.string.pref_text_size,
+                R.string.pref_smooth_scroll);
     }
 
     @Override
-    public View onCreateView(LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
-        final View view = getLayoutInflater(savedInstanceState).inflate(R.layout.fragment_item, container, false);
-        mEmptyView = view.findViewById(android.R.id.empty);
-        mRecyclerView = (RecyclerView) view.findViewById(R.id.recycler_view);
-        final int margin = getArguments().getInt(EXTRA_MARGIN, 0);
-        // TODO dirty trick to set margin, assuming parent is relative layout
-        final RelativeLayout.LayoutParams params = (RelativeLayout.LayoutParams) mRecyclerView.getLayoutParams();
-        params.rightMargin = margin;
-        params.leftMargin = margin;
-        mRecyclerView.setLayoutParams(params);
-        mRecyclerView.setLayoutManager(new LinearLayoutManager(getActivity()) {
-            @Override
-            public int getOrientation() {
-                return LinearLayout.VERTICAL;
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setHasOptionsMenu(true);
+        if (savedInstanceState != null) {
+            mCacheMode = savedInstanceState.getInt(STATE_CACHE_MODE, ItemManager.MODE_DEFAULT);
+            mItem = savedInstanceState.getParcelable(STATE_ITEM);
+            mItemId = savedInstanceState.getString(STATE_ITEM_ID);
+            mAdapterItems = savedInstanceState.getParcelable(STATE_ADAPTER_ITEMS);
+        } else {
+            mCacheMode = getArguments().getInt(EXTRA_CACHE_MODE, ItemManager.MODE_DEFAULT);
+            WebItem item = getArguments().getParcelable(EXTRA_ITEM);
+            if (item instanceof Item) {
+                mItem = (Item) item;
             }
+            mItemId = item != null ? item.getId() : null;
+        }
+    }
+
+    @Override
+    public View onCreateView(LayoutInflater inflater, @Nullable ViewGroup container, @Nullable final Bundle savedInstanceState) {
+        final View view = getLayoutInflater(savedInstanceState).inflate(R.layout.fragment_item, container, false);
+        mEmptyView = view.findViewById(R.id.empty);
+        mRecyclerView = (RecyclerView) view.findViewById(R.id.recycler_view);
+        mRecyclerView.setLayoutManager(new SnappyLinearLayoutManager(getActivity(), true));
+        mItemDecoration = new CommentItemDecoration(getActivity());
+        mRecyclerView.addItemDecoration(mItemDecoration);
+        mSwipeRefreshLayout = (SwipeRefreshLayout) view.findViewById(R.id.swipe_layout);
+        mSwipeRefreshLayout.setColorSchemeResources(R.color.white);
+        mSwipeRefreshLayout.setProgressBackgroundColorSchemeResource(R.color.redA200);
+        mSwipeRefreshLayout.setOnRefreshListener(() -> {
+            if (TextUtils.isEmpty(mItemId)) {
+                return;
+            }
+            mCacheMode = ItemManager.MODE_NETWORK;
+            if (mAdapter != null) {
+                mAdapter.setCacheMode(mCacheMode);
+            }
+            loadKidData();
         });
-        mRecyclerView.setHasFixedSize(true);
         return view;
     }
 
     @Override
-    public void onActivityCreated(@Nullable Bundle savedInstanceState) {
-        super.onActivityCreated(savedInstanceState);
-        if (savedInstanceState != null) {
-            final ItemManager.Item savedItem = savedInstanceState.getParcelable(EXTRA_ITEM);
-            if (savedItem != null) {
-                mItem = savedItem;
-            }
-        }
-
-        if (mItem != null) {
-            bindKidData(mItem.getKidItems(), savedInstanceState);
-        }
+    public void onViewCreated(View view, @Nullable Bundle savedInstanceState) {
+        super.onViewCreated(view, savedInstanceState);
+        mScrollableHelper = new KeyDelegate.RecyclerViewHelper(mRecyclerView,
+                KeyDelegate.RecyclerViewHelper.SCROLL_ITEM);
+        mScrollableHelper.smoothScrollEnabled(Preferences.smoothScrollEnabled(getActivity()));
     }
 
     @Override
-    public void onResume() {
-        super.onResume();
-        mIsResumed = true;
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == R.id.menu_comments) {
+            showPreferences();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
     }
 
     @Override
     public void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        outState.putParcelable(EXTRA_ITEM, mItem);
+        outState.putParcelable(STATE_ITEM, mItem);
+        outState.putString(STATE_ITEM_ID, mItemId);
+        outState.putParcelable(STATE_ADAPTER_ITEMS, mAdapterItems);
+        outState.putInt(STATE_CACHE_MODE, mCacheMode);
     }
 
     @Override
-    public void onPause() {
-        mIsResumed = false;
-        super.onPause();
+    public void onDetach() {
+        super.onDetach();
+        mRecyclerView.setAdapter(null);
+        mPreferenceObservable.unsubscribe(getActivity());
     }
 
-    private void bindKidData(final ItemManager.Item[] items, final @Nullable Bundle savedInstanceState) {
-        if (items == null || items.length == 0) {
+    @Override
+    public void scrollToTop() {
+        mScrollableHelper.scrollToTop();
+    }
+
+    @Override
+    public boolean scrollToNext() {
+        return mScrollableHelper.scrollToNext();
+    }
+
+    @Override
+    public boolean scrollToPrevious() {
+        return mScrollableHelper.scrollToPrevious();
+    }
+
+    @Override
+    public void onNavigate(int direction) {
+        if (mAdapter == null) { // no kids
+            return;
+        }
+        mAdapter.getNextPosition(mScrollableHelper.getCurrentPosition(),
+                direction,
+                position -> mAdapter.lockBinding(mScrollableHelper.scrollToPosition(position)));
+    }
+
+    @Override
+    protected void load() {
+        if (mItem != null) {
+            bindKidData();
+        } else if (!TextUtils.isEmpty(mItemId)) {
+            loadKidData();
+        }
+    }
+
+    @Override
+    protected void createOptionsMenu(Menu menu, MenuInflater inflater) {
+        inflater.inflate(R.menu.menu_item_view, menu);
+    }
+
+    private void loadKidData() {
+        mItemManager.getItem(mItemId, mCacheMode, new ItemResponseListener(this));
+    }
+
+    void onItemLoaded(@Nullable Item item) {
+        mSwipeRefreshLayout.setRefreshing(false);
+        if (item != null) {
+            mAdapterItems = null;
+            mItem = item;
+            notifyItemLoaded(item);
+            bindKidData();
+        }
+    }
+
+    private void bindKidData() {
+        if (mItem == null || mItem.getKidCount() == 0) {
             mEmptyView.setVisibility(View.VISIBLE);
             return;
         }
 
-        mRecyclerView.setAdapter(new RecyclerView.Adapter<ItemViewHolder>() {
-            @Override
-            public ItemViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
-                return new ItemViewHolder(getLayoutInflater(savedInstanceState)
-                        .inflate(R.layout.item_comment, parent, false));
+        String displayOption = Preferences.getCommentDisplayOption(getActivity());
+        if (Preferences.isSinglePage(getActivity(), displayOption)) {
+            boolean autoExpand = Preferences.isAutoExpand(getActivity(), displayOption);
+            // if collapsed or no saved state then start a fresh (adapter items all collapsed)
+            if (!autoExpand || mAdapterItems == null) {
+                mAdapterItems = new SinglePageItemRecyclerViewAdapter.SavedState(
+                        new ArrayList<>(Arrays.asList(mItem.getKidItems())));
             }
-
-            @Override
-            public void onBindViewHolder(final ItemViewHolder holder, int position) {
-                final ItemManager.Item item = items[position];
-                if (item.getLocalRevision() < mLocalRevision) {
-                    bindKidItem(holder, null);
-                    HackerNewsClient.getInstance(getActivity()).getItem(item.getId(),
-                            new ItemManager.ResponseListener<ItemManager.Item>() {
-                                @Override
-                                public void onResponse(ItemManager.Item response) {
-                                    if (response == null) {
-                                        return;
-                                    }
-
-                                    if (!mIsResumed) {
-                                        return;
-                                    }
-
-                                    item.populate(response);
-                                    item.setLocalRevision(mLocalRevision);
-                                    bindKidItem(holder, item);
-                                }
-
-                                @Override
-                                public void onError(String errorMessage) {
-                                    // do nothing
-                                }
-                            });
-                } else {
-                    bindKidItem(holder, item);
-                }
-            }
-
-            private void bindKidItem(final ItemViewHolder holder, final ItemManager.Item item) {
-                if (item == null) {
-                    holder.mPostedTextView.setText(getString(R.string.loading_text));
-                    holder.mContentTextView.setText(getString(R.string.loading_text));
-                    holder.mCommentButton.setVisibility(View.INVISIBLE);
-                } else {
-                    holder.mPostedTextView.setText(item.getDisplayedTime(getActivity()));
-                    AppUtils.setTextWithLinks(holder.mContentTextView, item.getText());
-                    if (item.getKidCount() > 0) {
-                        holder.mCommentText.setText(String.valueOf(item.getKidCount()));
-                        holder.mCommentButton.setVisibility(View.VISIBLE);
-                        holder.mCommentButton.setOnClickListener(new View.OnClickListener() {
-                            @Override
-                            public void onClick(View v) {
-                                openItem(holder, item);
-                            }
-                        });
-                        holder.itemView.setOnClickListener(new View.OnClickListener() {
-                            @Override
-                            public void onClick(View v) {
-                                openItem(holder, item);
-                            }
-                        });
-                    }
-                }
-            }
-
-            @Override
-            public int getItemCount() {
-                return items.length;
-            }
-
-            private void openItem(ItemViewHolder holder, ItemManager.Item item) {
-                final Intent intent = new Intent(getActivity(), ItemActivity.class);
-                intent.putExtra(ItemActivity.EXTRA_ITEM, item);
-                intent.putExtra(ItemActivity.EXTRA_ITEM_LEVEL,
-                        getArguments().getInt(ItemActivity.EXTRA_ITEM_LEVEL, 0) + 1);
-                final ActivityOptionsCompat options = ActivityOptionsCompat
-                        .makeSceneTransitionAnimation(getActivity(),
-                                holder.itemView, getString(R.string.transition_item_container));
-                ActivityCompat.startActivity(getActivity(), intent, options.toBundle());
-            }
-        });
+            mAdapter = new SinglePageItemRecyclerViewAdapter(mItemManager, mAdapterItems, autoExpand);
+        } else {
+            mAdapter = new MultiPageItemRecyclerViewAdapter(mItemManager, mItem.getKidItems());
+        }
+        mAdapter.setCacheMode(mCacheMode);
+        mAdapter.initDisplayOptions(getActivity());
+        mRecyclerView.setAdapter(mAdapter);
     }
 
-    private static class ItemViewHolder extends RecyclerView.ViewHolder {
-        private final TextView mPostedTextView;
-        private final TextView mContentTextView;
-        private final View mCommentButton;
-        private final TextView mCommentText;
-
-        public ItemViewHolder(View itemView) {
-            super(itemView);
-            mPostedTextView = (TextView) itemView.findViewById(R.id.posted);
-            mContentTextView = (TextView) itemView.findViewById(R.id.text);
-            mCommentButton = itemView.findViewById(R.id.comment);
-            mCommentText = (TextView) mCommentButton.findViewById(R.id.text);
-            mCommentButton.setVisibility(View.INVISIBLE);
+    private void onPreferenceChanged(int key, boolean contextChanged) {
+        if (contextChanged || key == R.string.pref_comment_display) {
+            load();
+        } else if (mAdapter != null) {
+            mScrollableHelper.smoothScrollEnabled(Preferences.smoothScrollEnabled(getActivity()));
+            mItemDecoration.setColorCodeEnabled(Preferences.colorCodeEnabled(getActivity()));
+            mItemDecoration.setThreadIndicatorEnabled(Preferences.threadIndicatorEnabled(getActivity()));
+            mAdapter.initDisplayOptions(getActivity());
+            mAdapter.notifyDataSetChanged();
         }
+    }
+
+    private void showPreferences() {
+        Bundle args = new Bundle();
+        args.putInt(PopupSettingsFragment.EXTRA_TITLE, R.string.font_options);
+        args.putInt(PopupSettingsFragment.EXTRA_SUMMARY, R.string.pull_up_hint);
+        args.putIntArray(PopupSettingsFragment.EXTRA_XML_PREFERENCES, new int[]{
+                R.xml.preferences_font,
+                R.xml.preferences_comments});
+        ((DialogFragment) Fragment.instantiate(getActivity(),
+                PopupSettingsFragment.class.getName(), args))
+                .show(getFragmentManager(), PopupSettingsFragment.class.getName());
+    }
+
+    private void notifyItemLoaded(@NonNull Item item) {
+        if (getActivity() instanceof ItemChangedListener) {
+            ((ItemChangedListener) getActivity()).onItemChanged(item);
+        }
+    }
+
+    static class ItemResponseListener implements ResponseListener<Item> {
+        private WeakReference<ItemFragment> mItemFragment;
+
+        @Synthetic
+        ItemResponseListener(ItemFragment itemFragment) {
+            mItemFragment = new WeakReference<>(itemFragment);
+        }
+
+        @Override
+        public void onResponse(@Nullable Item response) {
+            if (mItemFragment.get() != null && mItemFragment.get().isAttached()) {
+                mItemFragment.get().onItemLoaded(response);
+            }
+        }
+
+        @Override
+        public void onError(String errorMessage) {
+            if (mItemFragment.get() != null && mItemFragment.get().isAttached()) {
+                mItemFragment.get().onItemLoaded(null);
+            }
+        }
+    }
+
+    interface ItemChangedListener {
+        void onItemChanged(@NonNull Item item);
     }
 }

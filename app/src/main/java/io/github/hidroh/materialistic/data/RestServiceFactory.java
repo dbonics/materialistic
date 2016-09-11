@@ -1,64 +1,89 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic.data;
 
-import android.content.Context;
-import android.util.Log;
+import android.os.Handler;
+import android.os.Looper;
+import android.support.annotation.NonNull;
 
-import com.squareup.okhttp.Cache;
-import com.squareup.okhttp.Interceptor;
-import com.squareup.okhttp.OkHttpClient;
-import com.squareup.okhttp.Request;
+import java.util.concurrent.Executor;
 
-import java.io.IOException;
+import javax.inject.Inject;
 
-import io.github.hidroh.materialistic.R;
-import retrofit.RestAdapter;
-import retrofit.client.OkClient;
+import okhttp3.Call;
+import retrofit2.Retrofit;
+import retrofit2.adapter.rxjava.RxJavaCallAdapterFactory;
+import retrofit2.converter.gson.GsonConverterFactory;
+import rx.schedulers.Schedulers;
 
-public class RestServiceFactory {
-    private static final String TAG_OK_HTTP = "OkHttp";
-    private static final long CACHE_SIZE = 1024 * 1024;
+public interface RestServiceFactory {
+    String CACHE_CONTROL_FORCE_CACHE = "Cache-Control: only-if-cached, max-stale=" + Integer.MAX_VALUE;
+    String CACHE_CONTROL_FORCE_NETWORK = "Cache-Control: no-cache";
+    String CACHE_CONTROL_MAX_AGE_30M = "Cache-Control: max-age=" + (30 * 60);
+    String CACHE_CONTROL_MAX_AGE_24H = "Cache-Control: max-age=" + (24 * 60 * 60);
 
-    public static <T> T create(Context context, String baseUrl, Class<T> clazz) {
-        final OkHttpClient okHttpClient = new OkHttpClient();
-        final boolean loggingEnabled = context.getResources().getBoolean(R.bool.debug);
-        if (loggingEnabled) {
-            okHttpClient.networkInterceptors().add(new LoggingInterceptor());
+    RestServiceFactory rxEnabled(boolean enabled);
+
+    <T> T create(String baseUrl, Class<T> clazz);
+
+    <T> T create(String baseUrl, Class<T> clazz, Executor callbackExecutor);
+
+    class Impl implements RestServiceFactory {
+        private final Call.Factory mCallFactory;
+        private boolean mRxEnabled;
+
+        @Inject
+        public Impl(Call.Factory callFactory) {
+            this.mCallFactory = callFactory;
         }
-        try {
-            okHttpClient.setCache(new Cache(context.getApplicationContext().getCacheDir(),
-                    CACHE_SIZE));
-        } catch (IOException e) {
-            // do nothing
+
+        @Override
+        public RestServiceFactory rxEnabled(boolean enabled) {
+            mRxEnabled = enabled;
+            return this;
         }
 
-        RestAdapter.Builder builder = new RestAdapter.Builder()
-                .setEndpoint(baseUrl)
-                .setClient(new OkClient(okHttpClient));
-        if (loggingEnabled) {
-            builder.setLogLevel(RestAdapter.LogLevel.BASIC);
+        @Override
+        public <T> T create(String baseUrl, Class<T> clazz) {
+            return create(baseUrl, clazz, null);
         }
-        return builder
-                .build()
-                .create(clazz);
 
+        @Override
+        public <T> T create(String baseUrl, Class<T> clazz, Executor callbackExecutor) {
+            Retrofit.Builder builder = new Retrofit.Builder();
+            if (mRxEnabled) {
+                builder.addCallAdapterFactory(RxJavaCallAdapterFactory
+                        .createWithScheduler(Schedulers.io()));
+            }
+            builder.callFactory(mCallFactory)
+                    .callbackExecutor(callbackExecutor != null ?
+                            callbackExecutor : new MainThreadExecutor());
+            return builder.baseUrl(baseUrl)
+                    .addConverterFactory(GsonConverterFactory.create())
+                    .build()
+                    .create(clazz);
+        }
     }
 
-    private static class LoggingInterceptor implements Interceptor {
-        @Override
-        public com.squareup.okhttp.Response intercept(Chain chain) throws IOException {
-            Request request = chain.request();
+    class MainThreadExecutor implements Executor {
+        private final Handler handler = new Handler(Looper.getMainLooper());
 
-            long t1 = System.nanoTime();
-            Log.d(TAG_OK_HTTP, String.format("---> %s (%s)%n%s",
-                    request.url(), chain.connection(), request.headers()));
-
-            com.squareup.okhttp.Response response = chain.proceed(request);
-
-            long t2 = System.nanoTime();
-            Log.d(TAG_OK_HTTP, String.format("<--- %s (%.1fms)%n%s",
-                    response.request().url(), (t2 - t1) / 1e6d, response.headers()));
-
-            return response;
+        @Override public void execute(@NonNull Runnable r) {
+            handler.post(r);
         }
     }
 }

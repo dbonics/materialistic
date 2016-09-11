@@ -1,399 +1,368 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic.data;
 
+import android.content.ContentResolver;
 import android.content.Context;
-import android.net.Uri;
-import android.os.Parcel;
-import android.text.TextUtils;
-import android.text.format.DateUtils;
+import android.support.annotation.NonNull;
 
-import retrofit.Callback;
-import retrofit.RetrofitError;
-import retrofit.client.Response;
-import retrofit.http.GET;
-import retrofit.http.Headers;
-import retrofit.http.Path;
+import java.io.IOException;
+
+import javax.inject.Inject;
+
+import retrofit2.Call;
+import retrofit2.http.GET;
+import retrofit2.http.Headers;
+import retrofit2.http.Path;
+import rx.Observable;
+import rx.Scheduler;
+import rx.android.schedulers.AndroidSchedulers;
 
 /**
  * Client to retrieve Hacker News content asynchronously
  */
-public class HackerNewsClient implements ItemManager {
+public class HackerNewsClient implements ItemManager, UserManager {
+    public static final String HOST = "hacker-news.firebaseio.com";
     public static final String BASE_WEB_URL = "https://news.ycombinator.com";
     public static final String WEB_ITEM_PATH = BASE_WEB_URL + "/item?id=%s";
-    private static final String BASE_API_URL = "https://hacker-news.firebaseio.com/v0";
-    private static final Object sLock = new Object();
-    private static HackerNewsClient sInstance;
-    private RestService mRestService;
+    static final String BASE_API_URL = "https://" + HOST + "/v0/";
+    private final RestService mRestService;
+    private final SessionManager mSessionManager;
+    private final FavoriteManager mFavoriteManager;
+    private final ContentResolver mContentResolver;
+    private Scheduler mIoScheduler;
 
-    /**
-     * Gets singleton client instance
-     * @return a hacker news client
-     */
-    public static HackerNewsClient getInstance(Context context) {
-        synchronized (sLock) {
-            if (sInstance == null) {
-                sInstance = new HackerNewsClient();
-                sInstance.mRestService = RestServiceFactory.create(context, BASE_API_URL, RestService.class);
-            }
+    @Inject
+    public HackerNewsClient(Context context, RestServiceFactory factory,
+                            SessionManager sessionManager,
+                            FavoriteManager favoriteManager,
+                            Scheduler ioScheduler) {
+        mRestService = factory.rxEnabled(true).create(BASE_API_URL, RestService.class);
+        mSessionManager = sessionManager;
+        mFavoriteManager = favoriteManager;
+        mContentResolver = context.getApplicationContext().getContentResolver();
+        mIoScheduler = ioScheduler;
+    }
 
-            return sInstance;
+    @Override
+    public void getStories(@FetchMode String filter, @CacheMode int cacheMode,
+                           final ResponseListener<Item[]> listener) {
+        if (listener == null) {
+            return;
+        }
+        Observable.defer(() -> getStoriesObservable(filter, cacheMode))
+                .subscribeOn(mIoScheduler)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(listener::onResponse,
+                        t -> listener.onError(t != null ? t.getMessage() : ""));
+    }
+
+    @Override
+    public void getItem(final String itemId, @CacheMode int cacheMode, ResponseListener<Item> listener) {
+        if (listener == null) {
+            return;
+        }
+        Observable<HackerNewsItem> itemObservable;
+        switch (cacheMode) {
+            case MODE_DEFAULT:
+            default:
+                itemObservable = mRestService.itemRx(itemId);
+                break;
+            case MODE_NETWORK:
+                itemObservable = mRestService.networkItemRx(itemId);
+                break;
+            case MODE_CACHE:
+                itemObservable = mRestService.cachedItemRx(itemId)
+                        .onErrorResumeNext(mRestService.itemRx(itemId));
+                break;
+        }
+        Observable.defer(() -> Observable.zip(
+                mSessionManager.isViewed(mContentResolver, itemId),
+                mFavoriteManager.check(mContentResolver, itemId),
+                itemObservable,
+                (isViewed, favorite, hackerNewsItem) -> {
+                    if (hackerNewsItem != null) {
+                        hackerNewsItem.preload();
+                        hackerNewsItem.setIsViewed(isViewed);
+                        hackerNewsItem.setFavorite(favorite);
+                    }
+                    return hackerNewsItem;
+                }))
+                .subscribeOn(mIoScheduler)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(listener::onResponse,
+                        t -> listener.onError(t != null ? t.getMessage() : ""));
+
+    }
+
+    @Override
+    public Item[] getStories(String filter, @CacheMode int cacheMode) {
+        try {
+            return toItems(getStoriesCall(filter, cacheMode).execute().body());
+        } catch (IOException e) {
+            return new Item[0];
         }
     }
 
     @Override
-    public void getStories(String filter, final ResponseListener<Item[]> listener) {
-        final Callback<int[]> callback = new Callback<int[]>() {
-            @Override
-            public void success(int[] ints, Response response) {
-                if (listener == null) {
-                    return;
-                }
-
-                Item[] topStories = new Item[ints == null ? 0 : ints.length];
-                for (int i = 0; i < topStories.length; i++) {
-                    topStories[i] = new HackerNewsItem(ints[i]);
-                }
-                listener.onResponse(topStories);
-            }
-
-            @Override
-            public void failure(RetrofitError error) {
-                if (listener == null) {
-                    return;
-                }
-
-                listener.onError(error == null ? error.getMessage() : "");
-            }
-        };
-        final FetchMode fetchMode;
+    public Item getItem(String itemId, @CacheMode int cacheMode) {
+        Call<HackerNewsItem> call;
+        switch (cacheMode) {
+            case MODE_DEFAULT:
+            case MODE_CACHE:
+            default:
+                call = mRestService.item(itemId);
+                break;
+            case MODE_NETWORK:
+                call = mRestService.networkItem(itemId);
+                break;
+        }
         try {
-            fetchMode = FetchMode.valueOf(filter);
-        } catch (IllegalArgumentException e) {
-            return;
-        } catch (NullPointerException e) {
+            return call.execute().body();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    @Override
+    public void getUser(String username, final ResponseListener<User> listener) {
+        if (listener == null) {
             return;
         }
+        mRestService.userRx(username)
+                .map(userItem -> {
+                    if (userItem != null) {
+                        userItem.setSubmittedItems(toItems(userItem.getSubmitted()));
+                    }
+                    return userItem;
+                })
+                .subscribeOn(mIoScheduler)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(listener::onResponse,
+                        t -> listener.onError(t != null ? t.getMessage() : ""));
+    }
 
-        switch (fetchMode) {
-            case newest:
-                mRestService.newStories(callback);
+    @NonNull
+    private Observable<Item[]> getStoriesObservable(@FetchMode String filter, @CacheMode int cacheMode) {
+        Observable<int[]> observable;
+        switch (filter) {
+            case NEW_FETCH_MODE:
+                observable = cacheMode == MODE_NETWORK ?
+                        mRestService.networkNewStoriesRx() : mRestService.newStoriesRx();
                 break;
-            case show:
-                mRestService.showStories(callback);
+            case SHOW_FETCH_MODE:
+                observable = cacheMode == MODE_NETWORK ?
+                        mRestService.networkShowStoriesRx() : mRestService.showStoriesRx();
                 break;
-            case ask:
-                mRestService.askStories(callback);
+            case ASK_FETCH_MODE:
+                observable = cacheMode == MODE_NETWORK ?
+                        mRestService.networkAskStoriesRx() : mRestService.askStoriesRx();
                 break;
-            case jobs:
-                mRestService.jobStories(callback);
+            case JOBS_FETCH_MODE:
+                observable = cacheMode == MODE_NETWORK ?
+                        mRestService.networkJobStoriesRx() : mRestService.jobStoriesRx();
+                break;
+            case BEST_FETCH_MODE:
+                observable = cacheMode == MODE_NETWORK ?
+                        mRestService.networkBestStoriesRx() : mRestService.bestStoriesRx();
                 break;
             default:
-                mRestService.topStories(callback);
+                observable = cacheMode == MODE_NETWORK ?
+                        mRestService.networkTopStoriesRx() : mRestService.topStoriesRx();
                 break;
         }
+        return observable.map(this::toItems);
     }
 
-    @Override
-    public void getItem(String itemId, final ItemManager.ResponseListener<Item> listener) {
-        mRestService.item(itemId, new Callback<HackerNewsItem>() {
-            @Override
-            public void success(HackerNewsItem item, Response response) {
-                if (listener == null) {
-                    return;
-                }
-
-                listener.onResponse(item);
-            }
-
-            @Override
-            public void failure(RetrofitError error) {
-                if (listener == null) {
-                    return;
-                }
-
-                listener.onError(error == null ? error.getMessage() : "");
-            }
-        });
+    @NonNull
+    private Call<int[]> getStoriesCall(@FetchMode String filter, @CacheMode int cacheMode) {
+        Call<int[]> call;
+        if (filter == null) {
+            // for legacy 'new stories' widgets
+            return cacheMode == MODE_NETWORK ?
+                    mRestService.networkNewStories() : mRestService.newStories();
+        }
+        switch (filter) {
+            case NEW_FETCH_MODE:
+                call = cacheMode == MODE_NETWORK ?
+                        mRestService.networkNewStories() : mRestService.newStories();
+                break;
+            case SHOW_FETCH_MODE:
+                call = cacheMode == MODE_NETWORK ?
+                        mRestService.networkShowStories() : mRestService.showStories();
+                break;
+            case ASK_FETCH_MODE:
+                call = cacheMode == MODE_NETWORK ?
+                        mRestService.networkAskStories() : mRestService.askStories();
+                break;
+            case JOBS_FETCH_MODE:
+                call = cacheMode == MODE_NETWORK ?
+                        mRestService.networkJobStories() : mRestService.jobStories();
+                break;
+            case BEST_FETCH_MODE:
+                call = cacheMode == MODE_NETWORK ?
+                        mRestService.networkBestStories() : mRestService.bestStories();
+                break;
+            default:
+                call = cacheMode == MODE_NETWORK ?
+                        mRestService.networkTopStories() : mRestService.topStories();
+                break;
+        }
+        return call;
     }
 
-    private static interface RestService {
-        @Headers("Cache-Control: max-age=600")
-        @GET("/topstories.json")
-        void topStories(Callback<int[]> callback);
-
-        @Headers("Cache-Control: max-age=600")
-        @GET("/newstories.json")
-        void newStories(Callback<int[]> callback);
-
-        @Headers("Cache-Control: max-age=600")
-        @GET("/showstories.json")
-        void showStories(Callback<int[]> callback);
-
-        @Headers("Cache-Control: max-age=600")
-        @GET("/askstories.json")
-        void askStories(Callback<int[]> callback);
-
-        @Headers("Cache-Control: max-age=600")
-        @GET("/jobstories.json")
-        void jobStories(Callback<int[]> callback);
-
-        @Headers("Cache-Control: max-age=300")
-        @GET("/item/{itemId}.json")
-        void item(@Path("itemId") String itemId, Callback<HackerNewsItem> callback);
+    private HackerNewsItem[] toItems(int[] ids) {
+        if (ids == null) {
+            return null;
+        }
+        HackerNewsItem[] items = new HackerNewsItem[ids.length];
+        for (int i = 0; i < items.length; i++) {
+            HackerNewsItem item = new HackerNewsItem(ids[i]);
+            item.rank = i + 1;
+            items[i] = item;
+        }
+        return items;
     }
 
-    static class HackerNewsItem implements Item {
-        // The item's unique id. Required.
-        private long id;
-        // true if the item is deleted.
-        private boolean deleted;
-        // The type of item. One of "job", "story", "comment", "poll", or "pollopt".
-        private String type;
-        // The username of the item's author.
-        private String by;
-        // Creation date of the item, in Unix Time.
-        private long time;
-        // The comment, Ask HN, or poll text. HTML.
-        private String text;
-        // true if the item is dead.
-        private boolean dead;
-        // The item's parent. For comments, either another comment or the relevant story. For pollopts, the relevant poll.
-        private long parent;
-        // The ids of the item's comments, in ranked display order.
-        private long[] kids;
-        // The URL of the story.
-        private String url;
-        // The story's score, or the votes for a pollopt.
-        private int score;
-        // The title of the story or poll.
-        private String title;
-        // A list of related pollopts, in display order.
-        private long[] parts;
-        // In the case of stories or polls, the total comment count.
-        private int descendants = -1;
-        private HackerNewsItem[] kidItems;
-        private boolean favorite;
-        private int localRevision = -1;
+    interface RestService {
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("topstories.json")
+        Observable<int[]> topStoriesRx();
 
-        public static final Creator<Item> CREATOR = new Creator<Item>() {
-            @Override
-            public Item createFromParcel(Parcel source) {
-                return new HackerNewsItem(source);
-            }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("newstories.json")
+        Observable<int[]> newStoriesRx();
 
-            @Override
-            public Item[] newArray(int size) {
-                return new Item[size];
-            }
-        };
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("showstories.json")
+        Observable<int[]> showStoriesRx();
 
-        HackerNewsItem(long id) {
-            this.id = id;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("askstories.json")
+        Observable<int[]> askStoriesRx();
 
-        private HackerNewsItem(Parcel source) {
-            id = source.readLong();
-            title = source.readString();
-            time = source.readLong();
-            by = source.readString();
-            kids = source.createLongArray();
-            url = source.readString();
-            text = source.readString();
-            type = source.readString();
-            favorite = source.readInt() == 0 ? false : true;
-            descendants = source.readInt();
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("jobstories.json")
+        Observable<int[]> jobStoriesRx();
 
-        @Override
-        public void populate(Item info) {
-            title = info.getTitle();
-            time = info.getTime();
-            by = info.getBy();
-            kids = info.getKids();
-            url = info.getRawUrl();
-            text = info.getText();
-            type = info.getRawType();
-            descendants = info.getDescendants();
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("beststories.json")
+        Observable<int[]> bestStoriesRx();
 
-        @Override
-        public String getRawType() {
-            return type;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("topstories.json")
+        Observable<int[]> networkTopStoriesRx();
 
-        @Override
-        public String getRawUrl() {
-            return url;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("newstories.json")
+        Observable<int[]> networkNewStoriesRx();
 
-        @Override
-        public long[] getKids() {
-            return kids;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("showstories.json")
+        Observable<int[]> networkShowStoriesRx();
 
-        @Override
-        public String getBy() {
-            return by;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("askstories.json")
+        Observable<int[]> networkAskStoriesRx();
 
-        @Override
-        public long getTime() {
-            return time;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("jobstories.json")
+        Observable<int[]> networkJobStoriesRx();
 
-        @Override
-        public int describeContents() {
-            return 0;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("beststories.json")
+        Observable<int[]> networkBestStoriesRx();
 
-        @Override
-        public void writeToParcel(Parcel dest, int flags) {
-            dest.writeLong(id);
-            dest.writeString(title);
-            dest.writeLong(time);
-            dest.writeString(by);
-            dest.writeLongArray(kids);
-            dest.writeString(url);
-            dest.writeString(text);
-            dest.writeString(type);
-            dest.writeInt(favorite ? 1 : 0);
-            dest.writeInt(descendants);
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("item/{itemId}.json")
+        Observable<HackerNewsItem> itemRx(@Path("itemId") String itemId);
 
-        @Override
-        public String getId() {
-            return String.valueOf(id);
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("item/{itemId}.json")
+        Observable<HackerNewsItem> networkItemRx(@Path("itemId") String itemId);
 
-        @Override
-        public String getTitle() {
-            return title;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_CACHE)
+        @GET("item/{itemId}.json")
+        Observable<HackerNewsItem> cachedItemRx(@Path("itemId") String itemId);
 
-        @Override
-        public String getDisplayedTitle() {
-            switch (getType()) {
-                case comment:
-                    return text;
-                case job:
-                case story:
-                case poll: // TODO poll need to display options
-                default:
-                    return title;
-            }
-        }
+        @GET("user/{userId}.json")
+        Observable<UserItem> userRx(@Path("userId") String userId);
 
-        @Override
-        public Type getType() {
-            try {
-                return !TextUtils.isEmpty(type) ? Type.valueOf(type) : Type.story;
-            } catch (IllegalArgumentException e) {
-                return Type.story;
-            }
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("topstories.json")
+        Call<int[]> topStories();
 
-        @Override
-        public CharSequence getDisplayedTime(Context context) {
-            try {
-                return String.format("%s by %s",
-                        DateUtils.getRelativeDateTimeString(context, time * 1000,
-                                DateUtils.MINUTE_IN_MILLIS,
-                                DateUtils.YEAR_IN_MILLIS,
-                                DateUtils.FORMAT_ABBREV_MONTH),
-                        by);
-            } catch (NullPointerException e) { // TODO should properly prevent this
-                return String.format("by %s", by);
-            }
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("newstories.json")
+        Call<int[]> newStories();
 
-        @Override
-        public int getKidCount() {
-            if (descendants > 0) {
-                return descendants;
-            }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("showstories.json")
+        Call<int[]> showStories();
 
-            return kids != null ? kids.length : 0;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("askstories.json")
+        Call<int[]> askStories();
 
-        @Override
-        public String getUrl() {
-            switch (getType()) {
-                case job:
-                case poll:
-                case comment:
-                    return getItemUrl(getId());
-                default:
-                    return TextUtils.isEmpty(url) ? getItemUrl(getId()) : url;
-            }
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("jobstories.json")
+        Call<int[]> jobStories();
 
-        private String getItemUrl(String itemId) {
-            return String.format(WEB_ITEM_PATH, itemId);
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("beststories.json")
+        Call<int[]> bestStories();
 
-        @Override
-        public String getSource() {
-            return TextUtils.isEmpty(url) ? null : Uri.parse(url).getHost();
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("topstories.json")
+        Call<int[]> networkTopStories();
 
-        @Override
-        public HackerNewsItem[] getKidItems() {
-            if (kids == null || kids.length == 0) {
-                return null;
-            }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("newstories.json")
+        Call<int[]> networkNewStories();
 
-            if (kidItems == null) {
-                kidItems = new HackerNewsItem[kids.length];
-                for (int i = 0; i < kids.length; i++) {
-                    kidItems[i] = new HackerNewsItem(kids[i]);
-                }
-            }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("showstories.json")
+        Call<int[]> networkShowStories();
 
-            return kidItems;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("askstories.json")
+        Call<int[]> networkAskStories();
 
-        @Override
-        public String getText() {
-            return text;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("jobstories.json")
+        Call<int[]> networkJobStories();
 
-        @Override
-        public boolean isShareable() {
-            Type itemType = !TextUtils.isEmpty(type) ? Type.valueOf(type) : Type.story;
-            switch (itemType) {
-                case story:
-                case poll:
-                case job:
-                    return true;
-                case comment:
-                    return false;
-                default:
-                    return false;
-            }
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("beststories.json")
+        Call<int[]> networkBestStories();
 
-        @Override
-        public boolean isFavorite() {
-            return favorite;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_MAX_AGE_30M)
+        @GET("item/{itemId}.json")
+        Call<HackerNewsItem> item(@Path("itemId") String itemId);
 
-        @Override
-        public void setFavorite(boolean favorite) {
-            this.favorite = favorite;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_NETWORK)
+        @GET("item/{itemId}.json")
+        Call<HackerNewsItem> networkItem(@Path("itemId") String itemId);
 
-        @Override
-        public int getLocalRevision() {
-            return localRevision;
-        }
+        @Headers(RestServiceFactory.CACHE_CONTROL_FORCE_CACHE)
+        @GET("item/{itemId}.json")
+        Call<HackerNewsItem> cachedItem(@Path("itemId") String itemId);
 
-        @Override
-        public void setLocalRevision(int localRevision) {
-            this.localRevision = localRevision;
-        }
-
-        @Override
-        public int getDescendants() {
-            return descendants;
-        }
+        @GET("user/{userId}.json")
+        Call<UserItem> user(@Path("userId") String userId);
     }
 }

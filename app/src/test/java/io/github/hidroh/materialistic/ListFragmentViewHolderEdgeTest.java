@@ -1,68 +1,93 @@
 package io.github.hidroh.materialistic;
 
+import android.annotation.SuppressLint;
+import android.os.Bundle;
+import android.support.v4.app.Fragment;
 import android.support.v7.widget.RecyclerView;
 import android.widget.TextView;
 
-import org.assertj.android.api.Assertions;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
+import org.mockito.MockitoAnnotations;
 import org.robolectric.Robolectric;
-import org.robolectric.RobolectricTestRunner;
+import org.robolectric.RobolectricGradleTestRunner;
 import org.robolectric.annotation.Config;
+import org.robolectric.internal.ShadowExtractor;
 import org.robolectric.util.ActivityController;
 
-import io.github.hidroh.materialistic.data.ItemManager;
-import io.github.hidroh.materialistic.test.ListActivity;
-import io.github.hidroh.materialistic.test.TestItem;
-import io.github.hidroh.materialistic.test.TestItemManager;
+import javax.inject.Inject;
+import javax.inject.Named;
 
-@Config(emulateSdk = 18, reportSdk = 18)
-@RunWith(RobolectricTestRunner.class)
+import io.github.hidroh.materialistic.data.HackerNewsClient;
+import io.github.hidroh.materialistic.data.Item;
+import io.github.hidroh.materialistic.data.ItemManager;
+import io.github.hidroh.materialistic.data.ResponseListener;
+import io.github.hidroh.materialistic.data.TestHnItem;
+import io.github.hidroh.materialistic.test.ListActivity;
+import io.github.hidroh.materialistic.test.ShadowRecyclerViewAdapter;
+
+import static org.assertj.android.api.Assertions.assertThat;
+import static org.mockito.Matchers.anyString;
+import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.verify;
+
+@Config(shadows = {ShadowRecyclerViewAdapter.class, ShadowRecyclerViewAdapter.ShadowViewHolder.class})
+@SuppressWarnings("ConstantConditions")
+@SuppressLint("WrongViewCast")
+@RunWith(RobolectricGradleTestRunner.class)
 public class ListFragmentViewHolderEdgeTest {
     private ActivityController<ListActivity> controller;
     private RecyclerView.ViewHolder holder;
-    private ListActivity activity;
-    public ItemManager.ResponseListener<ItemManager.Item> listener;
+    @Inject @Named(ActivityModule.HN) ItemManager itemManager;
+    @Captor ArgumentCaptor<ResponseListener<Item>> listener;
+    @Captor ArgumentCaptor<ResponseListener<Item[]>> storiesListener;
 
     @Before
     public void setUp() {
+        MockitoAnnotations.initMocks(this);
+        TestApplication.applicationGraph.inject(this);
+        reset(itemManager);
         controller = Robolectric.buildActivity(ListActivity.class)
                 .create().start().resume().visible();
-        activity = controller.get();
+        ListActivity activity = controller.get();
+        Bundle args = new Bundle();
+        args.putString(ListFragment.EXTRA_ITEM_MANAGER, HackerNewsClient.class.getName());
+        args.putString(ListFragment.EXTRA_FILTER, ItemManager.TOP_FETCH_MODE);
         activity.getSupportFragmentManager()
                 .beginTransaction()
-                .add(android.R.id.content, ListFragment.instantiate(activity, new TestItemManager() {
-
-                    @Override
-                    public void getStories(String filter, ResponseListener<Item[]> listener) {
-                        listener.onResponse(new Item[]{new TestItem() {}});
-                    }
-
-                    @Override
-                    public void getItem(String itemId, ResponseListener<Item> listener) {
-                        ListFragmentViewHolderEdgeTest.this.listener = listener;
-                    }
-                }, ItemManager.FetchMode.top.name()))
+                .add(android.R.id.content,
+                        Fragment.instantiate(activity, ListFragment.class.getName(), args))
                 .commit();
+        verify(itemManager).getStories(anyString(),
+                eq(ItemManager.MODE_DEFAULT),
+                storiesListener.capture());
+        storiesListener.getValue().onResponse(new Item[]{new TestHnItem(1L)});
         RecyclerView recyclerView = (RecyclerView) activity.findViewById(R.id.recycler_view);
-        holder = recyclerView.getAdapter().createViewHolder(recyclerView, 0);
-        recyclerView.getAdapter().bindViewHolder(holder, 0);
+        ShadowRecyclerViewAdapter shadowAdapter = ((ShadowRecyclerViewAdapter) ShadowExtractor
+                .extract(recyclerView.getAdapter()));
+        shadowAdapter.makeItemVisible(0);
+        holder = shadowAdapter.getViewHolder(0);
     }
 
     @Test
     public void testNullResponse() {
-        listener.onResponse(null);
-        Assertions.assertThat((TextView) holder.itemView.findViewById(R.id.title))
-                .hasText(activity.getString(R.string.loading_text));
+        verify(itemManager).getItem(anyString(), eq(ItemManager.MODE_DEFAULT), listener.capture());
+        listener.getValue().onResponse(null);
+        assertThat((TextView) holder.itemView.findViewById(R.id.title))
+                .hasText(R.string.loading_text);
     }
 
     @Test
     public void testErrorResponse() {
-        listener.onError(null);
-        Assertions.assertThat((TextView) holder.itemView.findViewById(R.id.title))
-                .hasText(activity.getString(R.string.loading_text));
+        verify(itemManager).getItem(anyString(), eq(ItemManager.MODE_DEFAULT), listener.capture());
+        listener.getValue().onError(null);
+        assertThat((TextView) holder.itemView.findViewById(R.id.title))
+                .hasText(R.string.loading_text);
     }
 
     @After

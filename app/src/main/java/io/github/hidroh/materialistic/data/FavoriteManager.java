@@ -1,6 +1,21 @@
+/*
+ * Copyright (c) 2015 Ha Duy Trung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package io.github.hidroh.materialistic.data;
 
-import android.content.AsyncQueryHandler;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
@@ -8,52 +23,100 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.CursorWrapper;
 import android.net.Uri;
-import android.os.AsyncTask;
-import android.os.Parcel;
+import android.os.Bundle;
+import android.support.annotation.NonNull;
+import android.support.annotation.WorkerThread;
+import android.support.v4.app.LoaderManager;
+import android.support.v4.content.Loader;
 import android.support.v4.content.LocalBroadcastManager;
 import android.text.TextUtils;
-import android.text.format.DateUtils;
 
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.Collection;
 
-import io.github.hidroh.materialistic.R;
+import javax.inject.Inject;
+
+import io.github.hidroh.materialistic.annotation.Synthetic;
+import rx.Observable;
+import rx.Scheduler;
+import rx.android.schedulers.AndroidSchedulers;
 
 /**
- * Data repository for {@link io.github.hidroh.materialistic.data.FavoriteManager.Favorite}
+ * Data repository for {@link Favorite}
  */
-public class FavoriteManager {
+public class FavoriteManager implements LocalItemManager<Favorite> {
 
-    public static final int LOADER = 0;
-    /**
-     * {@link android.content.Intent#getAction()} for broadcasting clearing all favorites
-     */
-    public static final String ACTION_CLEAR = FavoriteManager.class.getName() + ".ACTION_CLEAR";
+    private static final int LOADER = 0;
     /**
      * {@link android.content.Intent#getAction()} for broadcasting getting favorites matching query
      */
     public static final String ACTION_GET = FavoriteManager.class.getName() + ".ACTION_GET";
     /**
-     * {@link android.content.Intent#getAction()} for broadcasting adding favorites
-     */
-    public static final String ACTION_ADD = FavoriteManager.class.getName() + ".ACTION_ADD";
-    /**
-     * {@link android.content.Intent#getAction()} for broadcasting removing favorites
-     */
-    public static final String ACTION_REMOVE = FavoriteManager.class.getName() + ".ACTION_REMOVE";
-    /**
-     * {@link android.os.Bundle} key for {@link #ACTION_GET} that contains array of
-     * {@link io.github.hidroh.materialistic.data.FavoriteManager.Favorite}
+     * {@link android.os.Bundle} key for {@link #ACTION_GET} that contains {@link ArrayList} of
+     * {@link Favorite}
      */
     public static final String ACTION_GET_EXTRA_DATA = ACTION_GET + ".EXTRA_DATA";
-    /**
-     * {@link android.os.Bundle} key for {@link #ACTION_ADD} that contains added favorite item ID string
-     */
-    public static final String ACTION_ADD_EXTRA_DATA = ACTION_ADD + ".EXTRA_DATA";
-    /**
-     * {@link android.os.Bundle} key for {@link #ACTION_REMOVE} that contains array of
-     * {@link io.github.hidroh.materialistic.data.FavoriteManager.Favorite}
-     */
-    public static final String ACTION_REMOVE_EXTRA_DATA = ACTION_REMOVE + ".EXTRA_DATA";
+    private static final String URI_PATH_ADD = "add";
+    private static final String URI_PATH_REMOVE = "remove";
+    private static final String URI_PATH_CLEAR = "clear";
+    private final Scheduler mIoScheduler;
+    @Synthetic Cursor mCursor;
+
+    @Override
+    public int getSize() {
+        return mCursor != null ? mCursor.getCount() : 0;
+    }
+
+    @Override
+    public Favorite getItem(int position) {
+        return mCursor.moveToPosition(position) ? mCursor.getFavorite() : null;
+    }
+
+    @Override
+    public void attach(@NonNull Context context, @NonNull LoaderManager loaderManager,
+                       @NonNull Observer observer, String filter) {
+        loaderManager.restartLoader(FavoriteManager.LOADER, null,
+                new LoaderManager.LoaderCallbacks<android.database.Cursor>() {
+                    @Override
+                    public Loader<android.database.Cursor> onCreateLoader(int id, Bundle args) {
+                        if (!TextUtils.isEmpty(filter)) {
+                            return new FavoriteManager.CursorLoader(context, filter);
+                        }
+                        return new FavoriteManager.CursorLoader(context);
+                    }
+
+                    @Override
+                    public void onLoadFinished(Loader<android.database.Cursor> loader,
+                                               android.database.Cursor data) {
+                        if (data != null) {
+                            data.setNotificationUri(context.getContentResolver(),
+                                    MaterialisticProvider.URI_FAVORITE);
+                            mCursor = new Cursor(data);
+                        } else {
+                            mCursor = null;
+                        }
+                        observer.onChanged();
+                    }
+
+                    @Override
+                    public void onLoaderReset(Loader<android.database.Cursor> loader) {
+                        mCursor = null;
+                        observer.onChanged();
+                    }
+                });
+    }
+
+    @Override
+    public void detach() {
+        if (mCursor != null) {
+            mCursor.close();
+        }
+    }
+
+    @Inject
+    public FavoriteManager(Scheduler ioScheduler) {
+        mIoScheduler = ioScheduler;
+    }
 
     /**
      * Gets all favorites matched given query, a {@link #ACTION_GET} broadcast will be sent upon
@@ -62,205 +125,176 @@ public class FavoriteManager {
      * @param query     query to filter stories to be retrieved
      * @see #makeGetIntentFilter()
      */
-    public static void get(Context context, String query) {
-        final String selection;
-        final String[] selectionArgs;
-        if (TextUtils.isEmpty(query)) {
-            selection = null;
-            selectionArgs = null;
-
-        } else {
-            selection = MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TITLE + " LIKE ?";
-            selectionArgs = new String[]{"%" + query + "%"};
-        }
-
-        final LocalBroadcastManager broadcastManager = LocalBroadcastManager.getInstance(context);
-        new AsyncQueryHandler(context.getContentResolver()) {
-            @Override
-            protected void onQueryComplete(int token, Object cookie, android.database.Cursor cursor) {
-                super.onQueryComplete(token, cookie, cursor);
-                if (cursor == null) {
-                    return;
-                }
-
-                Favorite[] favorites = new Favorite[cursor.getCount()];
-                int count = 0;
-                Cursor favoriteCursor = new Cursor(cursor);
-                boolean any = favoriteCursor.moveToFirst();
-                if (any) {
+    public void get(Context context, String query) {
+        Observable.defer(() -> Observable.just(query))
+                .map(filter -> query(context, filter))
+                .filter(cursor -> cursor != null && cursor.moveToFirst())
+                .map(cursor -> {
+                    ArrayList<Favorite> favorites = new ArrayList<>(cursor.getCount());
+                    Cursor favoriteCursor = new Cursor(cursor);
                     do {
-                        favorites[count] = favoriteCursor.getFavorite();
-                        count++;
+                        favorites.add(favoriteCursor.getFavorite());
                     } while (favoriteCursor.moveToNext());
-
-                }
-                broadcastManager.sendBroadcast(makeGetBroadcastIntent(favorites));
-            }
-        }.startQuery(0, null, MaterialisticProvider.URI_FAVORITE, null, selection, selectionArgs, null);
+                    favoriteCursor.close();
+                    return favorites;
+                })
+                .defaultIfEmpty(new ArrayList<>())
+                .map(FavoriteManager::makeGetBroadcastIntent)
+                .subscribeOn(mIoScheduler)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(LocalBroadcastManager.getInstance(context)::sendBroadcast);
     }
 
     /**
-     * Adds given story as favorite, a {@link #ACTION_ADD} broadcast will be sent upon completion
+     * Adds given story as favorite
      * @param context   an instance of {@link android.content.Context}
      * @param story     story to be added as favorite
-     * @see #makeAddIntentFilter()
      */
-    public static void add(Context context, final ItemManager.WebItem story) {
-        final LocalBroadcastManager broadcastManager = LocalBroadcastManager.getInstance(context);
-        final ContentValues contentValues = new ContentValues();
-        contentValues.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID, story.getId());
-        contentValues.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_URL, story.getUrl());
-        contentValues.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TITLE, story.getDisplayedTitle());
-        contentValues.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TIME, String.valueOf(System.currentTimeMillis()));
-        new AsyncQueryHandler(context.getContentResolver()) {
-            @Override
-            protected void onInsertComplete(int token, Object cookie, Uri uri) {
-                super.onInsertComplete(token, cookie, uri);
-                if (cookie == null || story.getId() == null) {
-                    return;
-                }
-
-                if (cookie.equals(story.getId())) {
-                    broadcastManager.sendBroadcast(makeAddBroadcastIntent(story.getId()));
-                }
-            }
-        }.startInsert(0, story.getId(), MaterialisticProvider.URI_FAVORITE, contentValues);
+    public void add(Context context, WebItem story) {
+        Observable.defer(() -> Observable.just(story))
+                .map(item -> {
+                    insert(context, item);
+                    return item.getId();
+                })
+                .map(itemId -> buildAdded().appendPath(story.getId()).build())
+                .subscribeOn(mIoScheduler)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(uri -> context.getContentResolver().notifyChange(uri, null));
+        ItemSyncAdapter.initSync(context, story.getId());
     }
 
     /**
-     * Clears all stories matched given query from favorites, a {@link #ACTION_CLEAR} broadcast
+     * Clears all stories matched given query from favorites
      * will be sent upon completion
      * @param context   an instance of {@link android.content.Context}
      * @param query     query to filter stories to be cleared
-     * @see #makeClearIntentFilter()
      */
-    public static void clear(Context context, String query) {
-        final String selection;
-        final String[] selectionArgs;
-        if (TextUtils.isEmpty(query)) {
+    public void clear(Context context, String query) {
+        Observable.defer(() -> Observable.just(query))
+                .map(filter -> deleteMultiple(context, filter))
+                .subscribeOn(mIoScheduler)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(count -> context.getContentResolver()
+                        .notifyChange(buildCleared().build(), null));
+    }
+
+    /**
+     * Removes story with given ID from favorites
+     * upon completion
+     * @param context   an instance of {@link android.content.Context}
+     * @param itemId    story ID to be removed from favorites
+     */
+    public void remove(Context context, String itemId) {
+        if (itemId == null) {
+            return;
+        }
+        Observable.defer(() -> Observable.just(itemId))
+                .map(id -> {
+                    delete(context, id);
+                    return id;
+                })
+                .map(id -> buildRemoved().appendPath(itemId).build())
+                .subscribeOn(mIoScheduler)
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(uri -> context.getContentResolver().notifyChange(uri, null));
+    }
+
+    /**
+     * Removes multiple stories with given IDs from favorites
+     * be sent upon completion
+     * @param context   an instance of {@link android.content.Context}
+     * @param itemIds   array of story IDs to be removed from favorites
+     */
+    public void remove(Context context, Collection<String> itemIds) {
+        if (itemIds == null || itemIds.isEmpty()) {
+            return;
+        }
+        Observable.defer(() -> Observable.from(itemIds))
+                .subscribeOn(mIoScheduler)
+                .map(itemId -> {
+                    delete(context, itemId);
+                    return itemId;
+                })
+                .map(itemId -> buildRemoved().appendPath(itemId).build())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe(uri -> context.getContentResolver().notifyChange(uri, null));
+    }
+
+    @WorkerThread
+    @NonNull
+    Observable<Boolean> check(ContentResolver contentResolver, String itemId) {
+        if (TextUtils.isEmpty(itemId)) {
+            return Observable.just(false);
+        }
+        android.database.Cursor cursor = contentResolver
+                .query(MaterialisticProvider.URI_FAVORITE,
+                        null,
+                        MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID + " = ?",
+                        new String[]{itemId},
+                        null);
+        boolean result = false;
+        if (cursor != null) {
+            result = cursor.getCount() > 0;
+            cursor.close();
+        }
+        return Observable.just(result);
+    }
+
+    @WorkerThread
+    private android.database.Cursor query(Context context, String filter) {
+        String selection;
+        String[] selectionArgs;
+        if (TextUtils.isEmpty(filter)) {
             selection = null;
             selectionArgs = null;
 
         } else {
             selection = MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TITLE + " LIKE ?";
+            selectionArgs = new String[]{"%" + filter + "%"};
+        }
+        return context.getContentResolver()
+                .query(MaterialisticProvider.URI_FAVORITE,
+                        null,
+                        selection,
+                        selectionArgs,
+                        null);
+    }
+
+    @WorkerThread
+    private Uri insert(Context context, WebItem story) {
+        ContentValues cv = new ContentValues();
+        cv.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID, story.getId());
+        cv.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_URL, story.getUrl());
+        cv.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TITLE, story.getDisplayedTitle());
+        cv.put(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TIME,
+                story instanceof Favorite ?
+                        String.valueOf(((Favorite) story).getTime()) :
+                        String.valueOf(System.currentTimeMillis()));
+        return context.getContentResolver().
+                insert(MaterialisticProvider.URI_FAVORITE, cv);
+    }
+
+    @WorkerThread
+    private int delete(Context context, String itemId) {
+        return context.getContentResolver()
+                .delete(MaterialisticProvider.URI_FAVORITE,
+                        MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID + " = ?",
+                        new String[]{itemId});
+    }
+
+    @WorkerThread
+    private int deleteMultiple(Context context, String query) {
+        String selection;
+        String[] selectionArgs;
+        if (TextUtils.isEmpty(query)) {
+            selection = null;
+            selectionArgs = null;
+        } else {
+            selection = MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TITLE + " LIKE ?";
             selectionArgs = new String[]{"%" + query + "%"};
         }
-
-        final LocalBroadcastManager broadcastManager = LocalBroadcastManager.getInstance(context);
-        new AsyncQueryHandler(context.getContentResolver()) {
-            @Override
-            protected void onDeleteComplete(int token, Object cookie, int result) {
-                super.onDeleteComplete(token, cookie, result);
-                broadcastManager.sendBroadcast(makeClearBroadcastIntent());
-            }
-        }.startDelete(0, null, MaterialisticProvider.URI_FAVORITE, selection, selectionArgs);
-    }
-
-    /**
-     * Checks if a story with given ID is a favorite
-     * @param context   an instance of {@link android.content.Context}
-     * @param itemId    story ID to check
-     * @param callbacks listener to be informed upon checking completed
-     */
-    public static void check(Context context, final String itemId, final OperationCallbacks callbacks) {
-        if (itemId == null) {
-            return;
-        }
-
-        new AsyncQueryHandler(context.getContentResolver()) {
-            @Override
-            protected void onQueryComplete(int token, Object cookie, android.database.Cursor cursor) {
-                super.onQueryComplete(token, cookie, cursor);
-                if (cookie == null) {
-                    return;
-                }
-
-                if (callbacks == null) {
-                    return;
-                }
-
-                if (itemId.equals(cookie)) {
-                    callbacks.onCheckComplete(cursor.getCount() > 0);
-                }
-            }
-        }.startQuery(0, itemId, MaterialisticProvider.URI_FAVORITE, null,
-                MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID + " = ?",
-                new String[]{itemId}, null);
-    }
-
-    /**
-     * Removes story with given ID from favorites, a {@link #ACTION_REMOVE} broadcast will be sent
-     * upon completion
-     * @param context   an instance of {@link android.content.Context}
-     * @param itemId    story ID to be removed from favorites
-     * @see #makeRemoveIntentFilter()
-     */
-    public static void remove(Context context, final String itemId) {
-        if (itemId == null) {
-            return;
-        }
-
-        final LocalBroadcastManager broadcastManager = LocalBroadcastManager.getInstance(context);
-        new AsyncQueryHandler(context.getContentResolver()) {
-            @Override
-            protected void onDeleteComplete(int token, Object cookie, int result) {
-                super.onDeleteComplete(token, cookie, result);
-                if (cookie == null || itemId == null) {
-                    return;
-                }
-
-                if (cookie.equals(itemId)) {
-                    broadcastManager.sendBroadcast(makeRemoveBroadcastIntent(itemId));
-                }
-            }
-        }.startDelete(0, itemId, MaterialisticProvider.URI_FAVORITE,
-                MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID + " = ?",
-                new String[]{itemId});
-    }
-
-    /**
-     * Removes multiple stories with given IDs from favorites, a {@link #ACTION_CLEAR} broadcast will
-     * be sent upon completion
-     * @param context   an instance of {@link android.content.Context}
-     * @param itemIds   array of story IDs to be removed from favorites
-     * @see #makeClearIntentFilter()
-     */
-    public static void remove(Context context, Set<String> itemIds) {
-        if (itemIds == null || itemIds.isEmpty()) {
-            return;
-        }
-
-        final ContentResolver contentResolver = context.getContentResolver();
-        final LocalBroadcastManager broadcastManager = LocalBroadcastManager.getInstance(context);
-        new AsyncTask<String, Integer, Integer>() {
-            @Override
-            protected Integer doInBackground(String... params) {
-                int deleted = 0;
-                for (String param : params) {
-                    deleted += contentResolver.delete(MaterialisticProvider.URI_FAVORITE,
-                            MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID + " = ?",
-                            new String[]{param});
-                }
-
-                return deleted;
-            }
-
-            @Override
-            protected void onPostExecute(Integer integer) {
-                super.onPostExecute(integer);
-                broadcastManager.sendBroadcast(makeClearBroadcastIntent());
-            }
-        }.execute(itemIds.toArray(new String[itemIds.size()]));
-    }
-
-    /**
-     * Creates an intent filter for clear action broadcast
-     * @return clear intent filter
-     * @see #remove(android.content.Context, java.util.Set)
-     * @see #clear(android.content.Context, String)
-     */
-    public static IntentFilter makeClearIntentFilter() {
-        return new IntentFilter(ACTION_CLEAR);
+        return context.getContentResolver()
+                .delete(MaterialisticProvider.URI_FAVORITE, selection, selectionArgs);
     }
 
     /**
@@ -272,146 +306,45 @@ public class FavoriteManager {
         return new IntentFilter(ACTION_GET);
     }
 
-    /**
-     * Creates an intent filter for add action broadcast
-     * @return add intent filter
-     * @see #add(android.content.Context, io.github.hidroh.materialistic.data.ItemManager.Item)
-     */
-    public static IntentFilter makeAddIntentFilter() {
-        return new IntentFilter(ACTION_ADD);
+    public static boolean isAdded(Uri uri) {
+        return uri.toString().startsWith(buildAdded().toString());
     }
 
-    /**
-     * Creates an intent filter for remove action broadcast
-     * @return remove intent filter
-     * @see #remove(android.content.Context, String)
-     */
-    public static IntentFilter makeRemoveIntentFilter() {
-        return new IntentFilter(ACTION_REMOVE);
+    public static boolean isRemoved(Uri uri) {
+        return uri.toString().startsWith(buildRemoved().toString());
     }
 
-    private static Intent makeClearBroadcastIntent() {
-        return new Intent(ACTION_CLEAR);
+    public static boolean isCleared(Uri uri) {
+        return uri.toString().startsWith(buildCleared().toString());
     }
 
-    private static Intent makeGetBroadcastIntent(Favorite[] favorites) {
+    private static Uri.Builder buildAdded() {
+        return MaterialisticProvider.URI_FAVORITE.buildUpon().appendPath(URI_PATH_ADD);
+    }
+
+    private static Uri.Builder buildRemoved() {
+        return MaterialisticProvider.URI_FAVORITE.buildUpon().appendPath(URI_PATH_REMOVE);
+    }
+
+    private static Uri.Builder buildCleared() {
+        return MaterialisticProvider.URI_FAVORITE.buildUpon().appendPath(URI_PATH_CLEAR);
+    }
+
+    private static Intent makeGetBroadcastIntent(ArrayList<Favorite> favorites) {
         final Intent intent = new Intent(ACTION_GET);
         intent.putExtra(ACTION_GET_EXTRA_DATA, favorites);
         return intent;
     }
 
-    private static Intent makeAddBroadcastIntent(String itemId) {
-        final Intent intent = new Intent(ACTION_ADD);
-        intent.putExtra(ACTION_ADD_EXTRA_DATA, itemId);
-        return intent;
-    }
-
-    private static Intent makeRemoveBroadcastIntent(String itemId) {
-        final Intent intent = new Intent(ACTION_REMOVE);
-        intent.putExtra(ACTION_REMOVE_EXTRA_DATA, itemId);
-        return intent;
-    }
-
     /**
-     * Represents a favorite item
+     * A cursor wrapper to retrieve associated {@link Favorite}
      */
-    public static class Favorite implements ItemManager.WebItem {
-        private String itemId;
-        private String url;
-        private String title;
-        private long time;
-
-        public static final Creator<Favorite> CREATOR = new Creator<Favorite>() {
-            @Override
-            public Favorite createFromParcel(Parcel source) {
-                return new Favorite(source);
-            }
-
-            @Override
-            public Favorite[] newArray(int size) {
-                return new Favorite[size];
-            }
-        };
-
-        private Favorite(String itemId, String url, String title, long time) {
-            this.itemId = itemId;
-            this.url = url;
-            this.title = title;
-            this.time = time;
-        }
-
-        private Favorite(Parcel source) {
-            itemId = source.readString();
-            url = source.readString();
-            title = source.readString();
-        }
-
-        @Override
-        public String getUrl() {
-            return url;
-        }
-
-        @Override
-        public boolean isShareable() {
-            return true;
-        }
-
-        @Override
-        public String getId() {
-            return itemId;
-        }
-
-        @Override
-        public String getDisplayedTitle() {
-            return title;
-        }
-
-        @Override
-        public String getDisplayedTime(Context context) {
-            return context.getString(R.string.saved, DateUtils.getRelativeDateTimeString(context, time,
-                    DateUtils.MINUTE_IN_MILLIS,
-                    DateUtils.YEAR_IN_MILLIS,
-                    DateUtils.FORMAT_ABBREV_MONTH));
-        }
-
-        @Override
-        public String getSource() {
-            return TextUtils.isEmpty(url) ? null : Uri.parse(url).getHost();
-        }
-
-        @Override
-        public Type getType() {
-            // TODO treating all saved items as stories for now
-            return Type.story;
-        }
-
-        @Override
-        public String toString() {
-            return String.format("%s - %s", title, url);
-        }
-
-        @Override
-        public int describeContents() {
-            return 0;
-        }
-
-        @Override
-        public void writeToParcel(Parcel dest, int flags) {
-            dest.writeString(itemId);
-            dest.writeString(url);
-            dest.writeString(title);
-        }
-    }
-
-    /**
-     * A cursor wrapper to retrieve associated {@link io.github.hidroh.materialistic.data.FavoriteManager.Favorite}
-     */
-    public static class Cursor extends CursorWrapper {
-        public Cursor(android.database.Cursor cursor) {
+    static class Cursor extends CursorWrapper {
+        Cursor(android.database.Cursor cursor) {
             super(cursor);
         }
 
-        public Favorite getFavorite() {
+        Favorite getFavorite() {
             final String itemId = getString(getColumnIndexOrThrow(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_ITEM_ID));
             final String url = getString(getColumnIndexOrThrow(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_URL));
             final String title = getString(getColumnIndexOrThrow(MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TITLE));
@@ -421,39 +354,27 @@ public class FavoriteManager {
     }
 
     /**
-     * A {@link android.support.v4.content.CursorLoader} to query {@link io.github.hidroh.materialistic.data.FavoriteManager.Favorite}
+     * A {@link android.support.v4.content.CursorLoader} to query {@link Favorite}
      */
-    public static class CursorLoader extends android.support.v4.content.CursorLoader {
+    static class CursorLoader extends android.support.v4.content.CursorLoader {
         /**
-         * Constructs a cursor loader to query all {@link io.github.hidroh.materialistic.data.FavoriteManager.Favorite}
+         * Constructs a cursor loader to query all {@link Favorite}
          * @param context    an instance of {@link android.content.Context}
          */
-        public CursorLoader(Context context) {
+        CursorLoader(Context context) {
             super(context, MaterialisticProvider.URI_FAVORITE, null, null, null, null);
         }
 
         /**
-         * Constructs a cursor loader to query {@link io.github.hidroh.materialistic.data.FavoriteManager.Favorite}
+         * Constructs a cursor loader to query {@link Favorite}
          * with title matching given query
          * @param context   an instance of {@link android.content.Context}
          * @param query     query to filter
          */
-        public CursorLoader(Context context, String query) {
+        CursorLoader(Context context, String query) {
             super(context, MaterialisticProvider.URI_FAVORITE, null,
                     MaterialisticProvider.FavoriteEntry.COLUMN_NAME_TITLE + " LIKE ?",
                     new String[]{"%" + query + "%"}, null);
         }
     }
-
-    /**
-     * Callback interface for asynchronous favorite CRUD operations
-     */
-    public static abstract class OperationCallbacks {
-        /**
-         * Fired when checking of favorite status is completed
-         * @param isFavorite    true if is favorite, false otherwise
-         */
-        public void onCheckComplete(boolean isFavorite) { }
-    }
-
 }

@@ -1,106 +1,89 @@
+plugins {
+    id "me.tatarka.retrolambda" version "3.2.5"
+}
+
 apply plugin: 'com.android.application'
-apply plugin: 'robolectric'
-apply plugin: 'jacoco'
-apply plugin: 'com.github.kt3k.coveralls'
 
 android {
-    compileSdkVersion 22
-    buildToolsVersion "21.1.2"
+    compileSdkVersion 24
+    buildToolsVersion "24.0.2"
 
     defaultConfig {
         applicationId "io.github.hidroh.materialistic"
         minSdkVersion 9
-        targetSdkVersion 22
-        versionCode 9
-        versionName "1.2"
-        resValue "bool", "debug", "true"
-    }
-
-    signingConfigs {
-        release {
-        }
+        //noinspection OldTargetApi
+        targetSdkVersion 24 // TODO http://b.android.com/212316
+        versionCode 61
+        versionName "3.0"
+        buildConfigField "int", "LATEST_RELEASE", "59"
+        buildConfigField "String", "GITHUB_TOKEN", "\"\""
+        buildConfigField "String", "READABILITY_TOKEN", "\"\""
     }
 
     buildTypes {
         release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.release
-            zipAlignEnabled true
-            resValue "bool", "debug", "false"
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android.txt'),
+                    'proguard-rules.pro',
+                    'proguard-square.pro',
+                    'proguard-support.pro',
+                    'proguard-rx.pro'
         }
+        leak.initWith(buildTypes.debug)
     }
 
-    sourceSets {
-        // Move the tests to test/java, test/res, etc...
-        androidTest {
-            java.srcDirs = ['src/test/java']
-        }
+    lintOptions {
+        htmlReport false
+        xmlReport false
+        textReport true
+        lintConfig file("${rootProject.getRootDir()}/lint.xml")
+        warningsAsErrors true
+        abortOnError true
+        explainIssues false
+        absolutePaths false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    aaptOptions {
+        cruncherEnabled = false
     }
 }
 
-robolectric {
-    // configure the set of classes for JUnit tests
-    include '**/*Test.class'
-    exclude '**/espresso/**/*.class'
-
-    // configure max heap size of the test JVM
-    maxHeapSize = '2048m'
-
-    // configure the test JVM arguments
-    jvmArgs '-XX:MaxPermSize=512m', '-XX:-UseSplitVerifier'
-
-    // Specify max number of processes (default is 1)
-    maxParallelForks = 1
-
-    // Specify max number of test classes to execute in a test process
-    // before restarting the process (default is unlimited)
-    forkEvery = 150
-
-    // configure whether failing tests should fail the build
-    ignoreFailures false
-
-    // use afterTest to listen to the test execution results
-    afterTest { descriptor, result ->
-        println "${descriptor.className} > ${descriptor.name} ${result.resultType}"
-    }
-}
-
-task jacocoTestReport(type: JacocoReport) {
-    reports {
-        xml.enabled true
-        csv.enabled false
-        xml.destination "${buildDir}/reports/jacoco/test/jacocoTestReport.xml"
-        html.destination "${buildDir}/reports/coverage"
-    }
-
-    classDirectories = fileTree(
-            dir: "${buildDir}/intermediates/classes/debug",
-            exclude: [
-                    '**/R.class',
-                    '**/R$*.class'
-            ])
-    sourceDirectories = files(android.sourceSets.main.java.srcDirs)
-    executionData = files("${buildDir}/jacoco/testDebug.exec")
-    doLast {
-        println "coveralls report has been generated to file://${buildDir}/reports/jacoco/test/jacocoTestReport.xml"
-        println "jacoco report has been generated to file://${reports.html.destination}/index.html"
-    }
+ext {
+    supportVersion = '24.2.0'
+    okHttpVersion = '3.4.1'
+    daggerVersion = '1.2.5'
+    leakCanaryVersion = '1.4-beta2'
+    retrofitVersion = '2.1.0'
 }
 
 dependencies {
     compile fileTree(dir: 'libs', include: ['*.jar'])
-    compile 'com.android.support:appcompat-v7:22.0.0'
-    compile 'com.android.support:recyclerview-v7:22.0.0'
-    compile 'com.android.support:cardview-v7:22.0.0'
-    compile 'com.android.support:support-v4:22.0.0'
-    compile 'com.squareup.retrofit:retrofit:1.9.0'
-    compile 'com.squareup.okhttp:okhttp-urlconnection:2.2.0'
-    compile 'com.squareup.okhttp:okhttp:2.2.0'
-    compile 'com.google.android.gms:play-services-analytics:7.0.0'
-    androidTestCompile 'org.robolectric:robolectric:2.4',
-            'com.squareup.assertj:assertj-android:1.0.0',
-            'com.squareup.assertj:assertj-android-support-v4:1.0.0',
-            'org.mockito:mockito-core:1.9.5+',
-            'junit:junit:4.11'
+    compile "com.android.support:appcompat-v7:$supportVersion",
+            "com.android.support:recyclerview-v7:$supportVersion",
+            "com.android.support:cardview-v7:$supportVersion",
+            "com.android.support:design:$supportVersion",
+            "com.android.support:preference-v7:$supportVersion",
+            "com.android.support:customtabs:$supportVersion",
+            "com.squareup.dagger:dagger:$daggerVersion",
+            "com.squareup.retrofit2:retrofit:$retrofitVersion",
+            "com.squareup.retrofit2:converter-gson:$retrofitVersion",
+            "com.squareup.retrofit2:adapter-rxjava:$retrofitVersion",
+            "com.squareup.okhttp3:okhttp:$okHttpVersion",
+            "com.squareup.okhttp3:logging-interceptor:$okHttpVersion",
+            "io.reactivex:rxandroid:1.2.1",
+            "io.reactivex:rxjava:1.1.7"
+    leakCompile "com.squareup.leakcanary:leakcanary-android:$leakCanaryVersion"
+    debugCompile "com.squareup.leakcanary:leakcanary-android-no-op:$leakCanaryVersion"
+    releaseCompile "com.squareup.leakcanary:leakcanary-android-no-op:$leakCanaryVersion"
+    testCompile "com.squareup.leakcanary:leakcanary-android-no-op:$leakCanaryVersion"
+    provided "com.squareup.dagger:dagger-compiler:$daggerVersion"
 }
+
+apply from: "${rootProject.getRootDir()}/robolectric.gradle"
+apply from: "${rootProject.getRootDir()}/jacoco.gradle"

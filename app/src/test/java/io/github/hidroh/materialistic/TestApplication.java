@@ -1,14 +1,24 @@
 package io.github.hidroh.materialistic;
 
-import org.robolectric.Robolectric;
 import org.robolectric.TestLifecycleApplication;
+import org.robolectric.shadows.ShadowApplication;
 
 import java.lang.reflect.Method;
 
-public class TestApplication extends android.app.Application implements TestLifecycleApplication {
+import dagger.ObjectGraph;
+
+public class TestApplication extends Application implements TestLifecycleApplication {
+    public static ObjectGraph applicationGraph = ObjectGraph.create(new TestActivityModule());
+
+    @Override
+    public ObjectGraph getApplicationGraph() {
+        return applicationGraph;
+    }
+
     @Override
     public void beforeTest(Method method) {
-        Robolectric.getShadowApplication().declareActionUnbindable("com.google.android.gms.analytics.service.START");
+        Preferences.sReleaseNotesSeen = true;
+        ShadowApplication.getInstance().declareActionUnbindable("com.google.android.gms.analytics.service.START");
     }
 
     @Override
